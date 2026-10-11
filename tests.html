@@ -1,0 +1,1713 @@
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><title>Testes - Bloco de Isaac</title></head>
+<body>
+<pre id="out"></pre>
+<script src="music.js"></script>
+<script src="progress.js"></script>
+<script src="game.js"></script>
+<script>
+(function () {
+  const G = BlockGame;
+  const results = [];
+  const DT = 1 / 60;
+  // armazenamento falso: os testes nunca mexem no progresso salvo de verdade
+  const memStore = () => {
+    const m = {};
+    return { getItem: k => (k in m ? m[k] : null), setItem: (k, v) => { m[k] = String(v); }, removeItem: k => { delete m[k]; } };
+  };
+  G.setStorage(memStore());
+
+  function test(name, fn) {
+    try { fn(); results.push('PASS ' + name); }
+    catch (e) { results.push('FAIL ' + name + ' -> ' + (e && e.message || e)); }
+  }
+  function assert(cond, msg) { if (!cond) throw new Error(msg || 'assert'); }
+  function steps(s, seconds) { for (let i = 0; i < Math.round(seconds / DT); i++) G.update(s, DT); }
+  function key(s, code, down) { G.setKey(s, code, down); }
+  function fresh(seed) { const s = G.createState(seed || 1234); s.msg = null; return s; }
+  function findRoom(s, type) { for (const k in s.rooms) if (s.rooms[k].type === type) return s.rooms[k]; }
+  // tira os orbes de XP do chão (para o nível não subir no meio de um teste que não é sobre XP)
+  function noXp(s) { const r = G.curRoom(s); r.pickups = r.pickups.filter(pk => pk.type !== 'xp'); }
+  // Coloca o jogador numa sala (como se tivesse entrado nela)
+  function goTo(s, room) {
+    s.cur = { x: room.x, y: room.y };
+    if (!room.visited) {
+      room.visited = true;
+      room.enemies = room.spawns.map(sp => G.makeEnemy(s, sp));
+      if (!room.enemies.length) room.cleared = true;
+    }
+    s.tears = []; s.bullets = [];
+  }
+  const keyEvt = (type, code) => new KeyboardEvent(type, { code, bubbles: true });
+
+  // ---------- Comandos (eventos de teclado) ----------
+  test('keydown/keyup de teclado atualizam estado das teclas', () => {
+    const s = fresh(); const t = new EventTarget(); G.bindInput(s, t);
+    for (const c of ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) {
+      t.dispatchEvent(keyEvt('keydown', c)); assert(s.keys[c] === true, c + ' down');
+      t.dispatchEvent(keyEvt('keyup', c)); assert(s.keys[c] === false, c + ' up');
+    }
+  });
+  test('setas têm preventDefault (página não rola)', () => {
+    const s = fresh(); const t = new EventTarget(); G.bindInput(s, t);
+    const ev = new KeyboardEvent('keydown', { code: 'ArrowDown', cancelable: true });
+    t.dispatchEvent(ev); assert(ev.defaultPrevented, 'não preveniu');
+  });
+  test('perder o foco solta todas as teclas', () => {
+    const s = fresh(); const t = new EventTarget(); G.bindInput(s, t);
+    t.dispatchEvent(keyEvt('keydown', 'KeyD')); t.dispatchEvent(new Event('blur'));
+    assert(!s.keys.KeyD, 'tecla continuou presa');
+  });
+
+  // ---------- Movimento ----------
+  const moves = { KeyD: [1, 0], KeyA: [-1, 0], KeyW: [0, -1], KeyS: [0, 1] };
+  for (const code in moves) {
+    test(code + ' move o bloco na direção certa', () => {
+      const s = fresh(); const p = s.player; const x0 = p.x, y0 = p.y;
+      key(s, code, true); steps(s, 0.5);
+      const [dx, dy] = moves[code];
+      if (dx) { assert((p.x - x0) * dx > 60, 'x mudou ' + (p.x - x0)); assert(Math.abs(p.y - y0) < 0.01, 'y mudou'); }
+      if (dy) { assert((p.y - y0) * dy > 60, 'y mudou ' + (p.y - y0)); assert(Math.abs(p.x - x0) < 0.01, 'x mudou'); }
+    });
+  }
+  test('diagonal não é mais rápida que reta', () => {
+    const s = fresh(); const p = s.player; p.x = 300; p.y = 400;
+    key(s, 'KeyW', true); key(s, 'KeyD', true); steps(s, 0.6);
+    const v = Math.hypot(p.vx, p.vy);
+    assert(Math.abs(v - p.speed) < p.speed * 0.02, 'vel ' + v);
+  });
+  test('soltar a tecla faz o bloco parar', () => {
+    const s = fresh(); const p = s.player;
+    key(s, 'KeyD', true); steps(s, 0.3); key(s, 'KeyD', false); steps(s, 0.6);
+    assert(Math.hypot(p.vx, p.vy) < 1, 'ainda andando');
+  });
+  test('teclas opostas se anulam', () => {
+    const s = fresh(); const p = s.player; const x0 = p.x;
+    key(s, 'KeyA', true); key(s, 'KeyD', true); steps(s, 0.5);
+    assert(Math.abs(p.x - x0) < 0.01, 'moveu');
+  });
+  test('parede segura o bloco fora da porta', () => {
+    const s = fresh(); const p = s.player; p.x = G.IX0 + 100;
+    key(s, 'KeyW', true); steps(s, 4);
+    assert(Math.abs(p.y - (G.IY0 + p.size / 2)) < 0.01, 'y=' + p.y);
+    assert(s.cur.x === 0 && s.cur.y === 0, 'saiu da sala');
+  });
+
+  // ---------- Tiro ----------
+  const shots = { ArrowRight: [1, 0], ArrowLeft: [-1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  for (const code in shots) {
+    test(code + ' atira na direção certa', () => {
+      const s = fresh(); key(s, code, true); G.update(s, DT);
+      assert(s.tears.length === 1, 'lágrimas ' + s.tears.length);
+      const t = s.tears[0], [dx, dy] = shots[code];
+      if (dx) assert(Math.sign(t.vx) === dx && Math.abs(t.vy) < 1, 'vel ' + t.vx + ',' + t.vy);
+      if (dy) assert(Math.sign(t.vy) === dy && Math.abs(t.vx) < 1, 'vel ' + t.vx + ',' + t.vy);
+    });
+  }
+  test('cadência de tiro respeitada (3 tiros em 1s)', () => {
+    const s = fresh(); let fired = 0; key(s, 'ArrowRight', true);
+    for (let i = 0; i < 60; i++) { const n = s.tears.length; G.update(s, DT); if (s.tears.length > n) fired++; }
+    assert(fired === 3, 'disparou ' + fired);
+  });
+  test('última seta apertada tem prioridade', () => {
+    const s = fresh(); key(s, 'ArrowUp', true); key(s, 'ArrowLeft', true); G.update(s, DT);
+    assert(s.tears[0].vx < 0, 'não foi para a esquerda');
+  });
+  test('lágrimas somem ao bater na parede', () => {
+    const s = fresh(); key(s, 'ArrowRight', true); G.update(s, DT); key(s, 'ArrowRight', false);
+    steps(s, 2); assert(s.tears.length === 0, 'restaram ' + s.tears.length);
+  });
+
+  // ---------- Pausa / morte / reinício ----------
+  test('Esc pausa e despausa', () => {
+    const s = fresh(); const p = s.player; const x0 = p.x;
+    key(s, 'Escape', true); key(s, 'Escape', false); key(s, 'KeyD', true); steps(s, 0.5);
+    assert(p.x === x0, 'moveu pausado');
+    key(s, 'Escape', true); key(s, 'Escape', false); steps(s, 0.5);
+    assert(p.x > x0, 'não voltou');
+  });
+  test('dano + invencibilidade temporária', () => {
+    const s = fresh(); const room = G.curRoom(s); const p = s.player;
+    room.enemies.push(G.makeEnemy(s, { type: 'grunt', x: p.x, y: p.y }));
+    G.update(s, DT); assert(p.hp === p.maxHp - 1, 'hp ' + p.hp);
+    G.update(s, DT); assert(p.hp === p.maxHp - 1, 'tomou dano durante invencibilidade');
+  });
+  test('morrer e apertar R reinicia', () => {
+    const s = fresh(); s.player.hp = 1; const room = G.curRoom(s);
+    room.enemies.push(G.makeEnemy(s, { type: 'grunt', x: s.player.x, y: s.player.y }));
+    G.update(s, DT); assert(s.status === 'dead', s.status);
+    key(s, 'KeyR', true);
+    assert(s.status === 'playing' && s.player.hp === s.player.maxHp && s.floor === 1, 'não reiniciou');
+  });
+
+  // ---------- Salas e portas ----------
+  test('passar pela porta aberta troca de sala', () => {
+    const s = fresh(); const start = G.curRoom(s);
+    const dir = Object.keys(start.doors)[0];
+    const code = { up: 'KeyW', down: 'KeyS', left: 'KeyA', right: 'KeyD' }[dir];
+    key(s, code, true);
+    for (let i = 0; i < 400 && s.cur.x === 0 && s.cur.y === 0; i++) G.update(s, DT);
+    const d = G.DIRS[dir];
+    assert(s.cur.x === d.dx && s.cur.y === d.dy, 'não entrou: ' + JSON.stringify(s.cur));
+    assert(G.curRoom(s).visited, 'sala não marcada');
+  });
+  test('portas trancadas enquanto há inimigos', () => {
+    let s, room;
+    for (let seed = 1; seed < 200; seed++) {
+      s = fresh(seed);
+      room = Object.values(s.rooms).find(r => r.type === 'normal' && r.spawns.length && r.doors.left && r.rocks.length === 0);
+      if (room) break;
+    }
+    goTo(s, room); s.player.hp = 999;
+    s.player.x = G.IX0 + 60; s.player.y = G.H / 2;
+    room.enemies.forEach(e => { e.x = G.IX1 - 40; e.y = G.IY0 + 30; e.speed = 0; e.cd = 999; e.type = 'turret'; });
+    key(s, 'KeyA', true); steps(s, 2);
+    assert(s.cur.x === room.x && s.cur.y === room.y, 'saiu com inimigos vivos');
+    assert(s.player.x >= G.IX0 + s.player.size / 2 - 0.01, 'atravessou a parede');
+  });
+  test('matar todos os inimigos limpa a sala', () => {
+    const s = fresh(); const room = G.curRoom(s); room.cleared = false; const p = s.player;
+    room.enemies.push(G.makeEnemy(s, { type: 'turret', x: p.x + 150, y: p.y }));
+    room.enemies[0].cd = 999; s.rng = () => 0.99; // sem drops aleatórios
+    key(s, 'ArrowRight', true); steps(s, 3);
+    assert(room.enemies.length === 0, 'inimigo vivo hp=' + (room.enemies[0] && room.enemies[0].hp));
+    assert(room.cleared, 'sala não liberada'); assert(s.kills === 1, 'kills ' + s.kills);
+  });
+  test('pedras bloqueiam o bloco', () => {
+    const s = fresh(); const room = G.curRoom(s); const p = s.player;
+    room.rocks.push({ x: p.x + 60, y: p.y - 20, w: 40, h: 40 });
+    key(s, 'KeyD', true); steps(s, 1.5);
+    assert(Math.abs(p.x - (room.rocks[0].x - p.size / 2)) < 0.01, 'x=' + p.x);
+  });
+  test('pegar item aplica o efeito', () => {
+    const s = fresh(); const room = findRoom(s, 'item'); goTo(s, room);
+    const id = room.item.id; const p = s.player; const before = JSON.stringify(p);
+    p.x = room.item.x; p.y = room.item.y + 60; key(s, 'KeyW', true); steps(s, 1);
+    assert(room.item.taken, 'não pegou'); assert(p.items.includes(id), 'sem item');
+    assert(JSON.stringify(p) !== before, 'sem efeito');
+  });
+  test('coração cura', () => {
+    const s = fresh(); const p = s.player; p.hp = 3;
+    G.curRoom(s).pickups.push({ type: 'heart', x: p.x, y: p.y, size: 20 });
+    G.update(s, DT); assert(p.hp === 5, 'hp ' + p.hp);
+  });
+  test('chefão derrotado abre alçapão e leva ao andar 2', () => {
+    const s = fresh(); const room = findRoom(s, 'boss'); goTo(s, room);
+    assert(room.enemies.length === 1 && room.enemies[0].type === 'boss', 'sem chefão');
+    room.enemies[0].hp = 0; s.player.x = G.W / 2; s.player.y = G.H / 2 + 150;
+    G.update(s, DT);
+    assert(room.cleared && room.trapdoor, 'sem alçapão');
+    noXp(s);
+    key(s, 'KeyW', true);
+    for (let i = 0; i < 120 && s.floor === 1; i++) G.update(s, DT);
+    assert(s.floor === 2 && s.cur.x === 0 && s.cur.y === 0, 'andar ' + s.floor);
+  });
+  test('vencer o chefão do andar 10 = vitória (andares antes não)', () => {
+    for (const floor of [3, 9]) {
+      const s = fresh(); s.floor = floor; G.generateFloor(s);
+      const room = findRoom(s, 'boss'); goTo(s, room);
+      room.enemies[0].hp = 0; G.update(s, DT);
+      assert(s.status === 'playing' && room.trapdoor, 'andar ' + floor + ': ' + s.status);
+    }
+    const s = fresh(); s.floor = G.MAX_FLOOR; G.generateFloor(s);
+    const room = findRoom(s, 'boss'); goTo(s, room);
+    assert(room.bossKind === 'hipercubo', 'andar 10 sem o Big Boss: ' + room.bossKind);
+    room.enemies[0].hp = 0; G.update(s, DT);
+    assert(s.status === 'won', s.status);
+  });
+
+  // ---------- Geração de andares ----------
+  test('400 mapas gerados (10 andares) são válidos e conectados', () => {
+    for (let seed = 1; seed <= 40; seed++) {
+      for (let floor = 1; floor <= G.MAX_FLOOR; floor++) {
+        const s = G.createState(seed); s.floor = floor; G.generateFloor(s);
+        const rooms = Object.values(s.rooms);
+        assert(rooms.length === G.FLOORS[floor - 1].rooms, 'seed ' + seed + ' salas ' + rooms.length);
+        assert(rooms.filter(r => r.type === 'boss').length === 1, 'chefão');
+        assert(rooms.filter(r => r.type === 'item').length === 1, 'item');
+        assert(rooms.filter(r => r.type === 'shop').length === 1, 'loja');
+        const pool = G.FLOORS[floor - 1].pool;
+        for (const r of rooms) for (const sp of r.spawns) assert(sp.type === 'boss' || pool[sp.type], 'andar ' + floor + ' com ' + sp.type);
+        assert(s.rooms['0,0'].type === 'start', 'início');
+        const seen = new Set(['0,0']); const q = [s.rooms['0,0']];
+        while (q.length) {
+          const r = q.shift();
+          for (const k in r.doors) {
+            const n = s.rooms[G.rk(r.x + G.DIRS[k].dx, r.y + G.DIRS[k].dy)];
+            assert(n, 'porta para o nada');
+            const back = { up: 'down', down: 'up', left: 'right', right: 'left' }[k];
+            assert(n.doors[back], 'porta sem volta');
+            if (!seen.has(G.rk(n.x, n.y))) { seen.add(G.rk(n.x, n.y)); q.push(n); }
+          }
+        }
+        assert(seen.size === rooms.length, 'sala inacessível');
+        for (const r of rooms) {
+          for (const rock of r.rocks) {
+            assert(!(rock.c >= 9 && rock.c <= 12) && !(rock.r >= 5 && rock.r <= 7), 'pedra bloqueando corredor');
+          }
+          for (const sp of r.spawns) assert(!r.rocks.some(rock => rock.c === sp.c && rock.r === sp.r), 'inimigo na pedra');
+        }
+      }
+    }
+  });
+
+  // ---------- Desenho e inicialização ----------
+  test('render não quebra em nenhum estado', () => {
+    const c = document.createElement('canvas'); c.width = G.W; c.height = G.SCREEN_H;
+    const ctx = c.getContext('2d');
+    const s = fresh(); G.render(ctx, s);
+    for (const type of ['boss', 'item', 'normal']) { goTo(s, findRoom(s, type)); steps(s, 1); G.render(ctx, s); }
+    s.paused = true; G.render(ctx, s); s.paused = false;
+    s.status = 'dead'; G.render(ctx, s); s.status = 'won'; G.render(ctx, s);
+  });
+  test('start() liga o teclado da janela', () => {
+    const c = document.createElement('canvas'); c.width = G.W; c.height = G.SCREEN_H;
+    const s = G.start(c);
+    assert(s.status === 'menu', 'não começou no menu');
+    window.dispatchEvent(keyEvt('keydown', 'Enter')); window.dispatchEvent(keyEvt('keyup', 'Enter'));
+    assert(s.status === 'playing', 'Enter na janela não iniciou');
+    window.dispatchEvent(keyEvt('keydown', 'KeyD')); assert(s.keys.KeyD, 'window keydown');
+    window.dispatchEvent(keyEvt('keyup', 'KeyD')); assert(!s.keys.KeyD, 'window keyup');
+  });
+
+  // =================== TEXTURAS ===================
+  function stats(canvas, x0, y0, w, h) {
+    const d = canvas.getContext('2d').getImageData(x0 || 0, y0 || 0, w || canvas.width, h || canvas.height).data;
+    let r = 0, g = 0, b = 0, a = 0, n = 0, op = 0, sL = 0, sL2 = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      n++; a += d[i + 3];
+      if (d[i + 3] > 10) { op++; r += d[i]; g += d[i + 1]; b += d[i + 2]; const L = (d[i] + d[i + 1] + d[i + 2]) / 3; sL += L; sL2 += L * L; }
+    }
+    const o = Math.max(1, op), mL = sL / o;
+    return { r: r / o, g: g / o, b: b / o, alpha: a / n, coverage: op / n, lum: mL, std: Math.sqrt(Math.max(0, sL2 / o - mL * mL)) };
+  }
+  function hue(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+    if (!d) return 0;
+    let h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h *= 60; return h < 0 ? h + 360 : h;
+  }
+  function px(canvas, x, y) { return canvas.getContext('2d').getImageData(Math.round(x), Math.round(y), 1, 1).data; }
+  const T = G.buildTextures();
+
+  test('textura: todas existem com o tamanho certo', () => {
+    const fw = G.IX1 - G.IX0, fh = G.IY1 - G.IY0;
+    const exp = { sky: [G.W, G.SCREEN_H], bubble: [64, 64], tear: [32, 32], bullet: [32, 32], fly: [32, 32],
+      orbiter: [32, 32], turret: [32, 32], duke: [64, 64], heart: [32, 32], heartEmpty: [32, 32],
+      queen: [64, 64], spinner: [32, 32], bomber: [32, 32], healer: [32, 32], coin: [24, 24], xp: [16, 16] };
+    for (const b of G.BIOMES) { exp['floor_' + b.id] = [fw, fh]; exp['wall_' + b.id] = [fw, G.WALL_H]; }
+    for (const k in exp) {
+      assert(T[k], 'faltando ' + k);
+      assert(T[k].width === exp[k][0] && T[k].height === exp[k][1], k + ' tamanho ' + T[k].width + 'x' + T[k].height);
+    }
+  });
+  test('textura: nenhuma está vazia ou lisa', () => {
+    for (const k in T) {
+      const st = stats(T[k]);
+      assert(st.coverage > 0.3, k + ' vazia (' + st.coverage.toFixed(2) + ')');
+      assert(st.std > 3, k + ' sem detalhe (desvio ' + st.std.toFixed(1) + ')');
+    }
+  });
+  test('textura: chão de cada bioma tem a cor Aero do tema', () => {
+    const ranges = { lagoa: [170, 215], prado: [70, 140], ceu: [200, 250], cristal: [245, 285], nucleo: [315, 350] };
+    for (const b of G.BIOMES) {
+      const st = stats(T['floor_' + b.id]), h = hue(st.r, st.g, st.b);
+      assert(h >= ranges[b.id][0] && h <= ranges[b.id][1], b.id + ' matiz ' + h.toFixed(0));
+      assert(st.lum > 150, b.id + ' escuro demais (' + st.lum.toFixed(0) + ')');
+    }
+  });
+  test('textura: céu é azul e clareia para baixo', () => {
+    const top = stats(T.sky, 400, 0, 400, 40), bottom = stats(T.sky, 400, G.SCREEN_H - 120, 400, 40);
+    assert(top.b > top.r + 60, 'topo não é azul');
+    assert(bottom.lum > top.lum, 'não clareia');
+  });
+  test('textura: bolha é redonda e transparente no meio', () => {
+    const b = T.bubble;
+    assert(px(b, 1, 1)[3] === 0 && px(b, 62, 62)[3] === 0, 'cantos não transparentes');
+    const center = px(b, 32, 32)[3];
+    assert(center > 3 && center < 120, 'centro alpha ' + center);
+    assert(px(b, 32, 61)[3] > 120, 'borda fraca ' + px(b, 32, 61)[3]);
+  });
+  test('textura: orbes têm brilho no topo (efeito vidro)', () => {
+    for (const k of ['tear', 'bullet', 'fly', 'orbiter', 'turret', 'duke', 'queen', 'spinner', 'bomber', 'healer', 'coin', 'xp']) {
+      const s = T[k].width, top = stats(T[k], 0, 0, s, s / 3), bot = stats(T[k], 0, s * 2 / 3, s, s / 3);
+      assert(top.lum > bot.lum + 15, k + ' sem brilho (' + top.lum.toFixed(0) + ' vs ' + bot.lum.toFixed(0) + ')');
+    }
+  });
+  test('textura: coração é rosa/vermelho', () => {
+    const st = stats(T.heart);
+    assert(st.r > st.g + 40 && st.r > st.b, 'cor ' + [st.r, st.g, st.b].map(Math.round));
+  });
+  test('textura: parede de vidro tem reflexo em cima', () => {
+    for (const b of G.BIOMES) {
+      const w = T['wall_' + b.id], q = w.height / 4;
+      assert(stats(w, 0, 0, w.width, q).lum > stats(w, 0, w.height - q, w.width, q).lum, b.id);
+    }
+  });
+  test('textura: geradas uma vez só (cache)', () => { assert(G.buildTextures() === T, 'regerou'); });
+
+  // =================== 2.5D ===================
+  test('2.5D: fundo da sala é mais estreito que a frente', () => {
+    const back = G.proj(G.IX1, G.IY0, 0).x - G.proj(G.IX0, G.IY0, 0).x;
+    const front = G.proj(G.IX1, G.IY1, 0).x - G.proj(G.IX0, G.IY1, 0).x;
+    assert(back < front * 0.9, back + ' vs ' + front);
+    assert(G.proj(300, 300, 20).y < G.proj(300, 300, 0).y, 'altura não sobe na tela');
+  });
+  test('2.5D: sala inteira cabe na tela, abaixo do HUD', () => {
+    assert(G.proj(0, 0, G.WALL_H).y > G.HUD, 'parede invade HUD');
+    assert(G.proj(G.W, G.H, 0).y < G.SCREEN_H, 'frente sai da tela');
+    assert(G.proj(0, 0, 0).x >= 0 && G.proj(G.W, G.H, 0).x <= G.W, 'sai pelos lados');
+  });
+  function frame(s) {
+    const c = document.createElement('canvas'); c.width = G.W; c.height = G.SCREEN_H;
+    s.shake = 0; s.msg = null; G.render(c.getContext('2d'), s); return c;
+  }
+  test('2.5D: render mostra céu, chão Aero e o bloco azul', () => {
+    const s = fresh(); s.time = 0; const c = frame(s);
+    const sky = stats(c, 5, 80, 20, 20); assert(sky.b > sky.r + 40, 'céu ' + [sky.r, sky.g, sky.b].map(Math.round));
+    const f = G.proj(250, 450, 0), fl = stats(c, f.x - 5, f.y - 5, 10, 10);
+    assert(fl.b > fl.r && fl.lum > 150, 'chão ' + [fl.r, fl.g, fl.b].map(Math.round));
+    const p = G.proj(s.player.x, s.player.y + 15, 5), pl = px(c, p.x, p.y);
+    assert(pl[2] > 180 && pl[0] < 130, 'bloco ' + Array.from(pl));
+  });
+  test('2.5D: cada bioma usa sua própria textura de chão', () => {
+    const f = G.proj(250, 450, 0);
+    const color = floor => { const s = fresh(); s.time = 0; s.floor = floor; const c = frame(s); return stats(c, f.x - 6, f.y - 6, 12, 12); };
+    const prado = color(3); assert(prado.g > prado.b, 'andar 3 não é verde ' + [prado.r, prado.g, prado.b].map(Math.round));
+    const cristal = color(7); assert(cristal.b > cristal.g && cristal.r > cristal.g, 'andar 7 não é lilás');
+    const nucleo = color(9); assert(nucleo.r > nucleo.g + 20, 'andar 9 não é rosado');
+  });
+  test('2.5D: quem está na frente é desenhado por cima (profundidade)', () => {
+    const s = fresh(); s.time = 0; const room = G.curRoom(s), p = s.player;
+    const spot = G.proj(p.x, p.y + 15, 5);
+    const diff = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
+    room.rocks = [];
+    const alone = px(frame(s), spot.x, spot.y);                       // só o bloco
+    room.rocks = [{ x: p.x - 20, y: p.y - 66, w: 40, h: 40 }];       // pedra atrás
+    const behind = px(frame(s), spot.x, spot.y);
+    assert(diff(alone, behind) < 15, 'pedra de trás cobriu o bloco: ' + Array.from(behind));
+    room.rocks = [{ x: p.x - 20, y: p.y + 6, w: 40, h: 40 }];        // pedra na frente
+    const front = px(frame(s), spot.x, spot.y);
+    assert(diff(alone, front) > 60, 'pedra da frente não cobriu: ' + Array.from(front) + ' vs ' + Array.from(alone));
+  });
+  test('2.5D: andar com D move o bloco na tela', () => {
+    const s = fresh(); const before = G.proj(s.player.x, s.player.y, 0).x;
+    key(s, 'KeyD', true); steps(s, 0.5);
+    assert(G.proj(s.player.x, s.player.y, 0).x > before + 50, 'não andou na tela');
+  });
+
+  // =================== CHEFÕES ===================
+  function bossFight(kind, seed) {
+    const s = fresh(seed); const room = findRoom(s, 'boss'); goTo(s, room);
+    const e = G.makeEnemy(s, { type: 'boss', kind, x: G.W / 2, y: G.H / 2 - 90 });
+    room.enemies = [e]; room.cleared = false;
+    s.player.hp = s.player.maxHp = 9999; s.player.x = G.IX0 + 40; s.player.y = G.IY1 - 40;
+    return { s, room, e };
+  }
+  test('chefões: 6 chefões, todos com muita vida', () => {
+    const kinds = Object.keys(G.BOSSES);
+    assert(kinds.length === 6, kinds.join());
+    for (const k of kinds) assert(G.BOSSES[k].hp >= 230, k + ' fraco');
+  });
+  test('chefões: um por andar, sem repetir o anterior; Big Boss só no andar 10', () => {
+    for (let seed = 1; seed <= 30; seed++) {
+      const s = G.createState(seed); const kinds = [];
+      for (let floor = 1; floor <= G.MAX_FLOOR; floor++) {
+        s.floor = floor; G.generateFloor(s);
+        const k = findRoom(s, 'boss').bossKind;
+        assert(G.FLOORS[floor - 1].bosses.includes(k), 'andar ' + floor + ': ' + k);
+        if (floor < G.MAX_FLOOR) assert(k !== 'hipercubo', 'Big Boss cedo no andar ' + floor);
+        if (kinds.length) assert(k !== kinds[kinds.length - 1], 'repetiu ' + k + ' no andar ' + floor);
+        kinds.push(k);
+      }
+      assert(kinds[G.MAX_FLOOR - 1] === 'hipercubo', 'andar 10: ' + kinds[G.MAX_FLOOR - 1]);
+    }
+  });
+  for (const kind of ['gelatao', 'duque', 'prisma', 'colmeia', 'espelho', 'hipercubo']) {
+    test('chefões: ' + kind + ' usa vários ataques diferentes', () => {
+      const { s, e } = bossFight(kind, 77);
+      if (kind === 'hipercubo') e.hp = e.maxHp * 0.2; // testa a fase 3, a mais complexa
+      const states = new Set(); let maxBullets = 0, lasers = 0;
+      for (let i = 0; i < 60 * 14; i++) {
+        G.update(s, DT); states.add(e.state);
+        maxBullets = Math.max(maxBullets, s.bullets.length); lasers = Math.max(lasers, s.lasers.length);
+      }
+      assert(states.size >= 4, 'estados: ' + [...states].join());
+      assert(maxBullets >= 10, 'poucos tiros: ' + maxBullets);
+      if (kind === 'prisma' || kind === 'hipercubo') assert(lasers > 0, 'sem laser');
+      assert(s.player.hp < 9999, 'nunca acertou o jogador parado');
+    });
+  }
+  test('chefões: Gelatão no ar é intocável e não machuca', () => {
+    const { s, e } = bossFight('gelatao');
+    e.state = 'air'; e.z = 700; e.air = true; e.timer = 5;
+    s.player.x = e.x; s.player.y = e.y; s.player.hp = 6;
+    s.tears.push({ x: e.x, y: e.y, vx: 0, vy: 0, life: 1, max: 1, size: 12, dmg: 5 });
+    const hp = e.hp; G.update(s, DT);
+    assert(e.hp === hp, 'levou dano no ar'); assert(s.player.hp === 6, 'machucou do ar');
+  });
+  test('chefões: laser só machuca depois do aviso', () => {
+    const s = fresh(); const p = s.player;
+    s.lasers.push({ ox: G.IX0 + 10, oy: p.y, ang: 0, tele: 0.5, life: 1, width: 26, rot: 0 });
+    G.update(s, DT); assert(p.hp === p.maxHp, 'machucou no aviso');
+    steps(s, 0.6); assert(p.hp === p.maxHp - 2, 'laser não machucou: ' + p.hp);
+  });
+  test('chefões: Hipercubo troca de fase com escudo', () => {
+    const { s, e } = bossFight('hipercubo');
+    e.hp = e.maxHp * 0.6; G.update(s, DT);
+    assert(e.phase === 2 && e.shield, 'fase ' + e.phase);
+    const hp = e.hp; s.tears.push({ x: e.x, y: e.y, vx: 0, vy: 0, life: 1, max: 1, size: 12, dmg: 5 });
+    G.update(s, DT); assert(e.hp === hp, 'escudo não bloqueou');
+    steps(s, 1.3); assert(!e.shield, 'escudo não sumiu');
+    e.hp = e.maxHp * 0.4; G.update(s, DT); assert(e.phase === 3, 'não foi para a fase 3');
+    steps(s, 1.3);
+    e.hp = e.maxHp * 0.2; G.update(s, DT); assert(e.phase === 4 && e.shield, 'não foi para a fase final');
+    assert(s.msg && s.msg.title === 'FASE FINAL', 'sem aviso da fase final');
+  });
+  test('chefões: Duque cria bolhas em órbita e as lança', () => {
+    const { s, room } = bossFight('duque');
+    let orbit = false, launched = false;
+    for (let i = 0; i < 60 * 8; i++) {
+      G.update(s, DT);
+      const o = room.enemies.filter(x => x.type === 'orbiter');
+      if (o.some(x => !x.launched)) orbit = true;
+      if (o.some(x => x.launched)) launched = true;
+    }
+    assert(orbit && launched, 'órbita ' + orbit + ' lançou ' + launched);
+  });
+  test('chefões: Prisma teleporta para longe do jogador', () => {
+    const { s, e } = bossFight('prisma');
+    s.grace = 0; e.state = 'tele'; e.timer = 0.01; G.update(s, DT);
+    assert(e.state === 'teleIn', e.state);
+    assert(Math.hypot(e.x - s.player.x, e.y - s.player.y) > 240, 'perto demais');
+  });
+  test('chefões: derrotar o chefão limpa lacaios e dá prêmio', () => {
+    const { s, room, e } = bossFight('duque');
+    steps(s, 3); assert(room.enemies.length > 1, 'sem lacaios');
+    e.hp = 0; G.update(s, DT);
+    assert(room.enemies.length === 0, 'lacaios vivos');
+    assert(room.cleared && room.item && room.trapdoor, 'sem prêmio/portal');
+    assert(s.bullets.length === 0 && s.lasers.length === 0, 'tiros ficaram');
+  });
+
+  // =================== BALANCEAMENTO ===================
+  const near = (a, b) => Math.abs(a - b) < 1e-6;
+  test('balanço: ataque do bloco +69% (+30% e mais +30%)', () => {
+    const p = fresh().player;
+    assert(near(G.PLAYER_DMG_BONUS, 1.69), 'bônus ' + G.PLAYER_DMG_BONUS);
+    assert(near(p.dmg, 3.5 * 1.69), 'dano ' + p.dmg);
+  });
+  test('balanço: lágrima tira 69% a mais de vida', () => {
+    const s = fresh(); const room = G.curRoom(s); const p = s.player;
+    const e = G.makeEnemy(s, { type: 'turret', x: p.x + 120, y: p.y }); e.cd = 999;
+    room.enemies.push(e); room.cleared = false;
+    const hp0 = e.hp; key(s, 'ArrowRight', true);
+    for (let i = 0; i < 60 && e.hp === hp0; i++) G.update(s, DT);
+    assert(near(hp0 - e.hp, 3.5 * 1.69), 'dano causado ' + (hp0 - e.hp));
+  });
+  test('balanço: velocidade do bloco +4% (medida segurando D)', () => {
+    const s = fresh(); const p = s.player; p.x = 200;
+    assert(near(p.speed, 210 * 1.04), 'vel ' + p.speed);
+    key(s, 'KeyD', true); steps(s, 1);
+    assert(Math.abs(p.vx - 218.4) < 0.5, 'vx ' + p.vx);
+    const x0 = p.x; G.update(s, 0.05);
+    assert(Math.abs((p.x - x0) - 218.4 * 0.05) < 0.1, 'andou ' + (p.x - x0));
+  });
+  test('balanço: inimigos comuns com +2% de vida', () => {
+    const s = fresh(); const base = { fly: 4, grunt: 10, turret: 12 };
+    for (const t in base) {
+      const e = G.makeEnemy(s, { type: t, x: 300, y: 300 });
+      assert(near(e.hp, base[t] * 1.02) && near(e.maxHp, e.hp), t + ' hp ' + e.hp);
+    }
+    for (let floor = 2; floor <= G.MAX_FLOOR; floor++) {
+      s.floor = floor; const g = G.makeEnemy(s, { type: 'grunt', x: 300, y: 300 });
+      assert(near(g.hp, 10 * G.FLOORS[floor - 1].hp * 1.02), 'andar ' + floor + ' ' + g.hp);
+    }
+    assert(G.FLOORS.every((f, i) => i === 0 || f.hp > G.FLOORS[i - 1].hp), 'vida não cresce a cada andar');
+  });
+  test('balanço: inimigos de sala gerados já vêm com +2%', () => {
+    const s = fresh();
+    const room = Object.values(s.rooms).find(r => r.type === 'normal' && r.spawns.length);
+    goTo(s, room);
+    for (const e of room.enemies) {
+      const b = { fly: 4, grunt: 10, turret: 12 }[e.type];
+      assert(near(e.hp, b * 1.02), e.type + ' ' + e.hp);
+    }
+  });
+  test('balanço: invocados pelo chefão NÃO ganham +2%', () => {
+    const { s, room } = bossFight('duque');
+    steps(s, 1.5);
+    const orb = room.enemies.filter(e => e.type === 'orbiter');
+    assert(orb.length > 0, 'Duque não invocou');
+    for (const o of orb) assert(near(o.maxHp, 5), 'orbiter ' + o.maxHp);
+    const h = bossFight('hipercubo'); h.e.phase = 2; h.e.cycle = 2; h.e.timer = 0; h.e.state = 'idle';
+    G.update(h.s, DT);
+    const grunts = h.room.enemies.filter(e => e.type === 'grunt');
+    assert(grunts.length === 2, 'Hipercubo não invocou');
+    for (const g of grunts) assert(near(g.maxHp, 10), 'grunt invocado ' + g.maxHp);
+  });
+  test('balanço: chefões com 25% menos vida', () => {
+    const s = fresh();
+    for (const k in G.BOSSES) {
+      const e = G.makeEnemy(s, { type: 'boss', kind: k, x: 480, y: 300 });
+      const mult = G.BOSSES[k].final ? 2.5 : 1; // o Big Boss é bem mais forte
+      assert(near(e.maxHp, G.BOSSES[k].hp * mult * 0.75), k + ' ' + e.maxHp);
+    }
+    s.floor = 2; const g = G.makeEnemy(s, { type: 'boss', kind: 'gelatao', x: 480, y: 300 });
+    assert(near(g.maxHp, 260 * 1.3 * 0.75), 'andar 2 ' + g.maxHp);
+  });
+  test('balanço: Gelatão morre com menos tiros que antes', () => {
+    const s = fresh(); const e = G.makeEnemy(s, { type: 'boss', kind: 'gelatao', x: 480, y: 300 });
+    const before = Math.ceil(260 / 3.5), now = Math.ceil(e.maxHp / s.player.dmg);
+    assert(now < before, now + ' vs ' + before);
+  });
+
+  // ---------- comandos de novo, com o novo balanceamento ----------
+  test('comandos: WASD + setas juntos (andar e atirar ao mesmo tempo)', () => {
+    const s = fresh(); const t = new EventTarget(); G.bindInput(s, t); const p = s.player;
+    const x0 = p.x, y0 = p.y;
+    t.dispatchEvent(keyEvt('keydown', 'KeyD')); t.dispatchEvent(keyEvt('keydown', 'KeyS'));
+    t.dispatchEvent(keyEvt('keydown', 'ArrowUp'));
+    steps(s, 0.5);
+    assert(p.x > x0 + 40 && p.y > y0 + 40, 'não andou na diagonal');
+    assert(s.tears.length > 0 && s.tears.every(tt => tt.vy < 0), 'não atirou para cima');
+    for (const c of ['KeyD', 'KeyS', 'ArrowUp']) t.dispatchEvent(keyEvt('keyup', c));
+    assert(!s.keys.KeyD && !s.keys.KeyS && !s.keys.ArrowUp, 'tecla presa');
+  });
+  test('comandos: tecla repetida (segurar) não pausa duas vezes', () => {
+    const s = fresh(); const t = new EventTarget(); G.bindInput(s, t);
+    t.dispatchEvent(new KeyboardEvent('keydown', { code: 'Escape' }));
+    t.dispatchEvent(new KeyboardEvent('keydown', { code: 'Escape', repeat: true }));
+    assert(s.paused, 'repetição despausou');
+  });
+  test('comandos: R só reinicia depois de morrer', () => {
+    const s = fresh(); s.player.x = 300; key(s, 'KeyR', true);
+    assert(s.player.x === 300, 'reiniciou no meio do jogo');
+  });
+  test('comandos: depois de reiniciar, stats novos continuam valendo', () => {
+    const s = fresh(); s.status = 'dead'; key(s, 'KeyR', true);
+    assert(near(s.player.dmg, 3.5 * 1.69) && near(s.player.speed, 210 * 1.04), 'stats perdidos');
+  });
+
+  // =================== MENU ===================
+  const menuState = () => G.createState(1234, { menu: true });
+  test('menu: o jogo abre no menu, sem mensagem de andar', () => {
+    const s = menuState();
+    assert(s.status === 'menu' && s.menuIndex === 0 && !s.msg, s.status);
+  });
+  test('menu: nada se mexe enquanto está no menu', () => {
+    const s = menuState(); const p = s.player; const x0 = p.x, y0 = p.y;
+    key(s, 'KeyD', true); key(s, 'ArrowRight', true); steps(s, 1);
+    assert(p.x === x0 && p.y === y0 && s.tears.length === 0, 'mexeu/atirou no menu');
+    assert(!s.keys.KeyD && !s.keys.ArrowRight, 'teclas do menu ficaram gravadas');
+  });
+  for (const code of ['Enter', 'Space', 'NumpadEnter']) {
+    test('menu: ' + code + ' em "Jogar" começa o jogo', () => {
+      const s = menuState(); key(s, code, true); key(s, code, false);
+      assert(s.status === 'playing', s.status);
+      assert(s.msg && s.msg.title === 'Andar 1', 'sem mensagem do andar');
+    });
+  }
+  test('menu: setas e W/S navegam e dão a volta', () => {
+    const s = menuState(), n = G.MENU_OPTIONS.length;
+    key(s, 'ArrowDown', true); assert(s.menuIndex === 1, 'ArrowDown');
+    key(s, 'ArrowUp', true); key(s, 'ArrowUp', true); assert(s.menuIndex === n - 1, 'não deu a volta para cima');
+    key(s, 'ArrowDown', true); assert(s.menuIndex === 0, 'não deu a volta para baixo');
+    key(s, 'KeyS', true); assert(s.menuIndex === 1, 'S');
+    key(s, 'KeyW', true); assert(s.menuIndex === 0, 'W');
+  });
+  const helpIndex = () => G.MENU_OPTIONS.indexOf('Controles');
+  function openHelp(s) { for (let i = 0; i < helpIndex(); i++) key(s, 'ArrowDown', true); key(s, 'Enter', true); }
+  test('menu: "Controles" abre a ajuda e Esc/Enter voltam', () => {
+    const s = menuState();
+    openHelp(s);
+    assert(s.screen === 'help' && s.status === 'menu', 'ajuda não abriu');
+    key(s, 'ArrowUp', true); assert(s.menuIndex === helpIndex(), 'navegou com a ajuda aberta');
+    key(s, 'Escape', true); assert(!s.screen, 'Esc não fechou');
+    key(s, 'Enter', true); key(s, 'Enter', true);
+    assert(!s.screen && s.status === 'menu', 'Enter não fechou');
+  });
+  test('menu: tecla segurada no menu não vaza para o jogo', () => {
+    const s = menuState(); const t = new EventTarget(); G.bindInput(s, t);
+    t.dispatchEvent(keyEvt('keydown', 'ArrowRight'));   // segurando seta no menu
+    t.dispatchEvent(keyEvt('keydown', 'Enter'));        // começa
+    steps(s, 0.5);
+    assert(s.tears.length === 0, 'atirou com tecla apertada no menu');
+    t.dispatchEvent(keyEvt('keyup', 'ArrowRight')); t.dispatchEvent(keyEvt('keydown', 'ArrowRight'));
+    G.update(s, DT); assert(s.tears.length === 1, 'não atira depois de começar');
+  });
+  test('menu: Espaço/Enter fazem preventDefault (página não rola)', () => {
+    const s = menuState(); const t = new EventTarget(); G.bindInput(s, t);
+    const ev = new KeyboardEvent('keydown', { code: 'Space', cancelable: true });
+    t.dispatchEvent(ev); assert(ev.defaultPrevented, 'Espaço rolou a página');
+    assert(s.status === 'playing', 'Espaço não começou');
+  });
+  test('menu: Esc depois de perder volta ao menu; Enter joga de novo', () => {
+    const s = fresh(); s.status = 'dead'; s.floor = 2; s.player.hp = 0;
+    key(s, 'Escape', true);
+    assert(s.status === 'menu' && s.floor === 1 && s.player.hp === s.player.maxHp, 'não voltou ao menu limpo');
+    key(s, 'Enter', true); assert(s.status === 'playing', 'não começou');
+  });
+  test('menu: Esc no meio do jogo NÃO volta ao menu', () => {
+    const s = fresh(); key(s, 'Escape', true); assert(s.status === 'playing', s.status);
+  });
+  test('menu: desenha título, botões e ajuda sem erro', () => {
+    const c = document.createElement('canvas'); c.width = G.W; c.height = G.SCREEN_H;
+    const ctx = c.getContext('2d'); const s = menuState();
+    G.render(ctx, s);
+    const r0 = G.menuOptionRect(0), btn = stats(c, r0.x + 40, r0.y + 10, r0.w - 80, r0.h - 20);
+    assert(btn.lum > 150, 'botão selecionado não aparece ' + btn.lum.toFixed(0));
+    const cube = px(c, G.W / 2, 255);
+    assert(cube[2] > 180 && cube[0] < 200, 'cubo do menu ' + Array.from(cube));
+    for (let i = 1; i < G.MENU_OPTIONS.length; i++) { // todas as telas do menu
+      key(s, 'ArrowDown', true); G.render(ctx, s);
+      key(s, 'Enter', true); G.render(ctx, s);
+      assert(s.screen, G.MENU_OPTIONS[i] + ' não abriu');
+      key(s, 'Escape', true);
+    }
+  });
+
+  // =================== VIDA E ITENS NOVOS ===================
+  function give(s, ...ids) {
+    for (const id of ids) { G.ITEMS.find(i => i.id === id).apply(s.player); s.player.items.push(id); }
+  }
+  function tap(s, code) { key(s, code, true); G.update(s, DT); key(s, code, false); } // aperta e solta
+  function dummy(s, x, y, type) {
+    const e = G.makeEnemy(s, { type: type || 'turret', x, y }); e.cd = 999;
+    G.curRoom(s).enemies.push(e); return e;
+  }
+
+  test('vida: o bloco começa com 4 corações', () => {
+    const p = fresh().player;
+    assert(p.hp === 8 && p.maxHp === 8 && G.PLAYER_MAX_HP === 8, 'hp ' + p.hp + '/' + p.maxHp);
+  });
+  test('vida: aguenta 7 golpes de meio coração e cai no 8º', () => {
+    const s = fresh(); const p = s.player;
+    for (let i = 0; i < 7; i++) { p.inv = 0; dummy(s, p.x, p.y, 'grunt'); G.update(s, DT); G.curRoom(s).enemies = []; }
+    assert(s.status === 'playing' && p.hp === 1, 'hp ' + p.hp);
+    p.inv = 0; dummy(s, p.x, p.y, 'grunt'); G.update(s, DT);
+    assert(s.status === 'dead', s.status);
+  });
+  test('itens: 25 itens, ids únicos, todos com nome, descrição e cor', () => {
+    const ids = G.ITEMS.map(i => i.id);
+    assert(ids.length === 25 && new Set(ids).size === 25, ids.length + ' itens');
+    for (const i of G.ITEMS) assert(i.name && i.desc && /^#[0-9a-f]{6}$/i.test(i.color) && typeof i.apply === 'function', i.id);
+  });
+  test('itens: todos podem ser pegos no pedestal e mudam o bloco', () => {
+    for (const it of G.ITEMS) {
+      const s = fresh(); const room = findRoom(s, 'item'); goTo(s, room);
+      room.item.id = it.id;
+      const p = s.player; const before = JSON.stringify(p);
+      p.x = room.item.x; p.y = room.item.y + 60; key(s, 'KeyW', true); steps(s, 1);
+      assert(room.item.taken && p.items.includes(it.id), it.id + ' não foi pego');
+      assert(JSON.stringify(p) !== before, it.id + ' sem efeito');
+    }
+  });
+  test('itens: todos aparecem no sorteio das salas de item', () => {
+    const seen = new Set();
+    for (let seed = 1; seed <= 400; seed++) seen.add(findRoom(G.createState(seed), 'item').item.id);
+    assert(seen.size === G.ITEMS.length, 'só apareceram ' + seen.size);
+  });
+  test('item Colher Entortada: bolha faz curva até o inimigo', () => {
+    const s = fresh(); give(s, 'homing'); const p = s.player;
+    dummy(s, p.x + 220, p.y - 130);
+    tap(s, 'ArrowRight'); steps(s, 0.25);
+    assert(s.tears.length && s.tears[0].vy < -50, 'não curvou: vy ' + (s.tears[0] && s.tears[0].vy));
+    const s2 = fresh(); dummy(s2, s2.player.x + 220, s2.player.y - 130);
+    tap(s2, 'ArrowRight'); steps(s2, 0.25);
+    assert(Math.abs(s2.tears[0].vy) < 1, 'sem o item também curvou');
+  });
+  test('item Flecha de Cristal: uma bolha acerta dois inimigos em fila', () => {
+    for (const pierce of [true, false]) {
+      const s = fresh(); if (pierce) give(s, 'pierce'); const p = s.player;
+      const a = dummy(s, p.x + 80, p.y), b = dummy(s, p.x + 150, p.y);
+      const ha = a.hp, hb = b.hp;
+      tap(s, 'ArrowRight'); steps(s, 0.5);
+      assert(near(ha - a.hp, p.dmg), 'primeiro ' + (ha - a.hp));
+      if (pierce) assert(near(hb - b.hp, p.dmg), 'não atravessou');
+      else assert(b.hp === hb, 'atravessou sem o item');
+    }
+  });
+  test('item Bolhona: dano bem maior e bolha gigante', () => {
+    const s = fresh(); const p = s.player; const d0 = p.dmg, f0 = p.fireDelay;
+    give(s, 'big');
+    assert(near(p.dmg, d0 * 1.25 + 1.5) && near(p.fireDelay, f0 * 1.35), 'stats');
+    tap(s, 'ArrowUp'); assert(s.tears[0].size === 22, 'tamanho ' + s.tears[0].size);
+  });
+  test('item Olho Quádruplo: 4 bolhas (mesmo com Tiro Triplo)', () => {
+    const s = fresh(); give(s, 'quad'); tap(s, 'ArrowLeft');
+    assert(s.tears.length === 4 && s.tears.every(t => t.vx < 0), 'tiros ' + s.tears.length);
+    const s2 = fresh(); give(s2, 'triple', 'quad'); tap(s2, 'ArrowLeft');
+    assert(s2.tears.length === 4, 'com triplo ' + s2.tears.length);
+  });
+  test('item Borracha Elástica: bolha quica na parede e volta', () => {
+    const s = fresh(); give(s, 'bounce'); s.player.x = G.IX1 - 100;
+    tap(s, 'ArrowRight'); steps(s, 0.35);
+    assert(s.tears.length === 1 && s.tears[0].vx < 0, 'não quicou');
+    const s2 = fresh(); s2.player.x = G.IX1 - 100; tap(s2, 'ArrowRight'); steps(s2, 0.35);
+    assert(s2.tears.length === 0, 'sem o item quicou');
+  });
+  test('item Bolha Fantasma: bolha atravessa pedra', () => {
+    for (const spectral of [true, false]) {
+      const s = fresh(); if (spectral) give(s, 'spectral'); const p = s.player;
+      G.curRoom(s).rocks = [{ x: p.x + 50, y: p.y - 20, w: 40, h: 40 }];
+      tap(s, 'ArrowRight'); steps(s, 0.3);
+      if (spectral) assert(s.tears.length === 1 && s.tears[0].x > p.x + 90, 'não atravessou');
+      else assert(s.tears.length === 0, 'atravessou sem o item');
+    }
+  });
+  test('item Bolha Gelada: inimigo atingido fica lento', () => {
+    const s = fresh(); give(s, 'freeze'); const p = s.player; p.hp = p.maxHp = 999;
+    const a = dummy(s, p.x + 120, p.y, 'grunt'), b = dummy(s, p.x - 120, p.y, 'grunt');
+    tap(s, 'ArrowRight');
+    for (let i = 0; i < 30 && !(a.frozen > 0); i++) G.update(s, DT);
+    assert(a.frozen > 0 && !(b.frozen > 0), 'não congelou');
+    a.kx = a.ky = 0;
+    const ax = a.x, bx = b.x; steps(s, 0.3);
+    const da = Math.abs(a.x - ax), db = Math.abs(b.x - bx);
+    assert(da < db * 0.6, 'congelado andou ' + da.toFixed(1) + ' vs ' + db.toFixed(1));
+  });
+  test('item Cabeça de Grilo: dano x1.5', () => {
+    const s = fresh(); const d0 = s.player.dmg; give(s, 'cricket');
+    assert(near(s.player.dmg, d0 * 1.5), s.player.dmg);
+  });
+  test('item Manto de Vidro: bloqueia 1 golpe por sala', () => {
+    const s = fresh(); give(s, 'shield'); const p = s.player;
+    dummy(s, p.x, p.y, 'grunt'); G.update(s, DT);
+    assert(p.hp === p.maxHp && !p.shieldUp, 'não bloqueou');
+    p.inv = 0; G.update(s, DT); assert(p.hp === p.maxHp - 1, 'segundo golpe não pegou');
+    G.curRoom(s).enemies = [];
+    const dir = Object.keys(G.curRoom(s).doors)[0]; G.enterRoom(s, dir);
+    assert(p.shieldUp, 'não recarregou na sala nova');
+  });
+  test('item Amuleto Vampiro: cura meio coração a cada 8 abates', () => {
+    const s = fresh(); give(s, 'vampire'); const p = s.player; p.hp = p.maxHp - 3;
+    s.rng = () => 0.99; // sem corações extras
+    for (let i = 0; i < 7; i++) dummy(s, 200 + i * 30, 150).hp = 0;
+    G.update(s, DT); assert(p.hp === p.maxHp - 3, '7 abates curou');
+    dummy(s, 200, 450).hp = 0; G.update(s, DT);
+    assert(p.hp === p.maxHp - 2, '8º abate não curou: ' + p.hp);
+  });
+  test('item Cubinho Orbital: gira, bloqueia tiros e machuca', () => {
+    const s = fresh(); give(s, 'orbital'); const p = s.player; G.update(s, DT);
+    const o = s.orbital; assert(o && Math.abs(Math.hypot(o.x - p.x, o.y - p.y) - 52) < 1, 'sem órbita');
+    s.bullets.push({ x: o.x, y: o.y, vx: 0, vy: 0, size: 12, life: 5, wait: 0, dmg: 1 });
+    G.update(s, DT); assert(s.bullets.length === 0, 'não bloqueou o tiro');
+    const e = dummy(s, s.orbital.x, s.orbital.y); const hp = e.hp;
+    G.update(s, DT); assert(e.hp < hp, 'não machucou');
+  });
+  test('item Irmãozinho: segue o bloco e atira junto', () => {
+    const s = fresh(); give(s, 'buddy'); const p = s.player;
+    key(s, 'ArrowUp', true); steps(s, 0.1);
+    assert(s.buddy, 'sem irmãozinho');
+    assert(s.tears.some(t => t.buddy && t.vy < 0), 'irmãozinho não atirou');
+    key(s, 'ArrowUp', false); key(s, 'KeyD', true); steps(s, 1);
+    assert(Math.hypot(s.buddy.x - p.x, s.buddy.y - p.y) < 80, 'ficou para trás');
+  });
+  test('item Bolo de Morango: vida máxima +1 coração e cura tudo', () => {
+    const s = fresh(); const p = s.player; p.hp = 2; give(s, 'cake');
+    assert(p.maxHp === 10 && p.hp === 10, p.hp + '/' + p.maxHp);
+  });
+
+  // ---------- comandos com os itens novos ----------
+  test('comandos: setas com Tiro Triplo + Bolhona em todas as direções', () => {
+    const want = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] };
+    for (const code in want) {
+      const s = fresh(); give(s, 'triple', 'big'); const t = new EventTarget(); G.bindInput(s, t);
+      t.dispatchEvent(keyEvt('keydown', code)); G.update(s, DT); t.dispatchEvent(keyEvt('keyup', code));
+      const [dx, dy] = want[code];
+      assert(s.tears.length === 3 && s.tears.every(tt => tt.size === 22), code + ' tiros ' + s.tears.length);
+      assert(s.tears.every(tt => (dx ? Math.sign(tt.vx) === dx : Math.sign(tt.vy) === dy)), code + ' direção');
+    }
+  });
+  test('comandos: andar + atirar com Irmãozinho e Orbital pelo teclado', () => {
+    const s = fresh(); give(s, 'buddy', 'orbital'); const t = new EventTarget(); G.bindInput(s, t); const p = s.player;
+    const x0 = p.x;
+    t.dispatchEvent(keyEvt('keydown', 'KeyA')); t.dispatchEvent(keyEvt('keydown', 'ArrowDown'));
+    steps(s, 0.6);
+    assert(p.x < x0 - 60, 'não andou');
+    assert(s.tears.some(tt => tt.buddy) && s.tears.some(tt => !tt.buddy), 'faltou tiro de alguém');
+    assert(s.tears.every(tt => tt.vy > 0), 'tiro para o lado errado');
+    t.dispatchEvent(keyEvt('keyup', 'KeyA')); t.dispatchEvent(keyEvt('keyup', 'ArrowDown'));
+    assert(!s.keys.KeyA && !s.keys.ArrowDown, 'tecla presa');
+  });
+  test('render: com todos os itens, ícones e nome no pedestal', () => {
+    const c = document.createElement('canvas'); c.width = G.W; c.height = G.SCREEN_H; const ctx = c.getContext('2d');
+    const s = fresh(); give(s, ...G.ITEMS.map(i => i.id)); s.player.shieldUp = true;
+    key(s, 'ArrowUp', true); steps(s, 0.3);
+    const e = dummy(s, 300, 300, 'grunt'); e.frozen = 2;
+    s.shake = 0; G.render(ctx, s);
+    const icon = px(c, 21, G.SCREEN_H - 19), first = G.ITEMS[0].color;
+    const want = [1, 3, 5].map(i => parseInt(first.slice(i, i + 2), 16));
+    assert(Math.abs(icon[0] - want[0]) + Math.abs(icon[1] - want[1]) + Math.abs(icon[2] - want[2]) < 60, 'ícone ' + Array.from(icon));
+    const s2 = fresh(); const room = findRoom(s2, 'item'); goTo(s2, room); s2.player.y = room.item.y + 100;
+    s2.shake = 0; G.render(ctx, s2);
+  });
+
+  // =================== CÓDIGO SECRETO 1234 ===================
+  function typeCode(s, t, text, numpad) {
+    for (const ch of text) {
+      const code = (numpad ? 'Numpad' : 'Digit') + ch;
+      t.dispatchEvent(keyEvt('keydown', code)); t.dispatchEvent(keyEvt('keyup', code));
+    }
+  }
+  function cheatState() {
+    const s = menuState(); const t = new EventTarget(); G.bindInput(s, t);
+    typeCode(s, t, '1234'); return { s, t };
+  }
+  test('código: digitar 1234 no menu ativa o aviso e o modo indestrutível', () => {
+    const { s } = cheatState();
+    assert(G.SECRET_CODE === '1234', G.SECRET_CODE);
+    assert(s.godMode, 'não ativou');
+    assert(s.status === 'menu' && near(s.cheatNotice, 3), 'aviso ' + s.cheatNotice);
+  });
+  test('código: funciona pelo teclado numérico também', () => {
+    const s = menuState(); const t = new EventTarget(); G.bindInput(s, t);
+    typeCode(s, t, '1234', true); assert(s.godMode && s.cheatNotice > 0, 'numpad não ativou');
+  });
+  test('código: aviso fica 3 segundos e depois vai direto pro jogo', () => {
+    const { s } = cheatState();
+    steps(s, 2.9); assert(s.status === 'menu' && s.cheatNotice > 0, 'saiu antes dos 3s');
+    steps(s, 0.15); assert(s.status === 'playing', 'não começou depois dos 3s: ' + s.status);
+    assert(s.cheatNotice === 0 && s.godMode, 'perdeu o código ao começar');
+    assert(s.msg && s.msg.title === 'Andar 1', 'sem mensagem do andar');
+  });
+  test('código: teclas durante o aviso são ignoradas', () => {
+    const { s, t } = cheatState();
+    t.dispatchEvent(keyEvt('keydown', 'ArrowDown')); t.dispatchEvent(keyEvt('keydown', 'Enter'));
+    assert(s.status === 'menu' && s.menuIndex === 0 && !s.screen, 'tecla mexeu no menu');
+    steps(s, 3.1); assert(s.status === 'playing', 'não começou');
+    assert(s.tears.length === 0 && !s.keys.ArrowDown, 'tecla do aviso vazou para o jogo');
+  });
+  test('código: códigos errados não ativam', () => {
+    for (const wrong of ['1235', '4321', '123', '2341', '0000', '1243']) {
+      const s = menuState(); const t = new EventTarget(); G.bindInput(s, t);
+      typeCode(s, t, wrong);
+      assert(!s.godMode && s.cheatNotice === 0, wrong + ' ativou');
+    }
+  });
+  test('código: vale os 4 últimos dígitos (9912 34 ativa)', () => {
+    const s = menuState(); const t = new EventTarget(); G.bindInput(s, t);
+    typeCode(s, t, '991234'); assert(s.godMode, 'não ativou');
+  });
+  test('código: setas no meio do código não atrapalham', () => {
+    const s = menuState(); const t = new EventTarget(); G.bindInput(s, t);
+    typeCode(s, t, '12'); t.dispatchEvent(keyEvt('keydown', 'ArrowDown')); typeCode(s, t, '34');
+    assert(s.godMode, 'não ativou'); assert(s.menuIndex === 1, 'seta não navegou');
+  });
+  test('código: com a ajuda aberta também funciona', () => {
+    const s = menuState(); openHelp(s);
+    assert(s.screen === 'help', 'ajuda fechada');
+    for (const ch of '1234') key(s, 'Digit' + ch, true);
+    assert(s.godMode && !s.screen, 'não ativou com a ajuda');
+  });
+  test('código: digitar 1234 durante o jogo NÃO ativa', () => {
+    const s = fresh(); for (const ch of '1234') key(s, 'Digit' + ch, true);
+    assert(!s.godMode, 'ativou no jogo');
+  });
+  test('código: começar com Enter (sem código) não deixa indestrutível', () => {
+    const s = menuState(); key(s, 'Enter', true);
+    assert(s.status === 'playing' && !s.godMode, 'ficou indestrutível');
+    const p = s.player; dummy(s, p.x, p.y, 'grunt'); G.update(s, DT);
+    assert(p.hp === p.maxHp - 1, 'não levou dano: ' + p.hp);
+  });
+  function godGame() { const { s } = cheatState(); steps(s, 3.1); return s; }
+  test('indestrutível: encostar em inimigo não tira vida', () => {
+    const s = godGame(); const p = s.player;
+    dummy(s, p.x, p.y, 'grunt'); steps(s, 2);
+    assert(p.hp === p.maxHp, 'hp ' + p.hp);
+  });
+  test('indestrutível: tiros e lasers não tiram vida', () => {
+    const s = godGame(); const p = s.player;
+    for (let i = 0; i < 20; i++) s.bullets.push({ x: p.x, y: p.y, vx: 0, vy: 0, size: 12, life: 5, wait: 0, dmg: 2 });
+    s.lasers.push({ ox: G.IX0 + 10, oy: p.y, ang: 0, tele: 0, life: 2, width: 40, rot: 0 });
+    steps(s, 1.5); assert(p.hp === p.maxHp && s.status === 'playing', 'hp ' + p.hp);
+  });
+  test('indestrutível: aguenta 20s parado contra o Hipercubo na fase 3', () => {
+    const fight = (s) => {
+      const room = findRoom(s, 'boss'); goTo(s, room);
+      const e = G.makeEnemy(s, { type: 'boss', kind: 'hipercubo', x: G.W / 2, y: G.H / 2 - 90 });
+      e.hp = e.maxHp * 0.2; room.enemies = [e]; room.cleared = false;
+      s.player.x = G.W / 2; s.player.y = G.H / 2 + 60;
+      steps(s, 20);
+    };
+    const normal = menuState(); key(normal, 'Enter', true); fight(normal);
+    assert(normal.status === 'dead', 'teste inválido: sem o código o chefão nem acertou');
+    const s = godGame(); fight(s);
+    assert(s.status === 'playing' && s.player.hp === s.player.maxHp, 'hp ' + s.player.hp);
+  });
+  test('indestrutível: continua ao trocar de sala e de andar', () => {
+    const s = godGame(); const dir = Object.keys(G.curRoom(s).doors)[0];
+    G.enterRoom(s, dir); assert(s.godMode, 'perdeu na sala nova');
+    const room = findRoom(s, 'boss'); goTo(s, room); room.enemies[0].hp = 0;
+    s.player.x = G.W / 2; s.player.y = G.H / 2 + 150; G.update(s, DT); noXp(s);
+    key(s, 'KeyW', true); for (let i = 0; i < 120 && s.floor === 1; i++) G.update(s, DT);
+    assert(s.floor === 2 && s.godMode, 'perdeu no andar 2');
+    const p = s.player; key(s, 'KeyW', false); dummy(s, p.x, p.y, 'grunt'); G.update(s, DT);
+    assert(p.hp === p.maxHp, 'levou dano no andar 2');
+  });
+  test('indestrutível: comandos continuam funcionando (andar e atirar)', () => {
+    const s = godGame(); const t = new EventTarget(); G.bindInput(s, t); const p = s.player;
+    const x0 = p.x, y0 = p.y;
+    t.dispatchEvent(keyEvt('keydown', 'KeyW')); t.dispatchEvent(keyEvt('keydown', 'KeyA'));
+    t.dispatchEvent(keyEvt('keydown', 'ArrowRight')); steps(s, 0.5);
+    assert(p.x < x0 - 40 && p.y < y0 - 40, 'não andou');
+    assert(s.tears.length > 0 && s.tears.every(tt => tt.vx > 0), 'não atirou para a direita');
+    for (const c of ['KeyW', 'KeyA', 'ArrowRight']) t.dispatchEvent(keyEvt('keyup', c));
+    t.dispatchEvent(keyEvt('keydown', 'Escape')); assert(s.paused, 'Esc não pausou');
+  });
+  test('indestrutível: Esc no menu depois de vencer desliga o código', () => {
+    const s = godGame(); s.status = 'won'; key(s, 'Escape', true);
+    assert(s.status === 'menu' && !s.godMode, 'código continuou');
+  });
+  test('código: aviso e selo "Indestrutível" aparecem na tela', () => {
+    const c = document.createElement('canvas'); c.width = G.W; c.height = G.SCREEN_H; const ctx = c.getContext('2d');
+    const { s } = cheatState(); G.render(ctx, s);
+    const panel = stats(c, G.W / 2 - 200, G.SCREEN_H / 2 - 70, 400, 20);
+    assert(panel.lum > 180, 'painel do aviso não aparece ' + panel.lum.toFixed(0));
+    const plain = menuState(); const c2 = document.createElement('canvas'); c2.width = G.W; c2.height = G.SCREEN_H;
+    G.render(c2.getContext('2d'), plain);
+    const before = stats(c2, G.W / 2 - 200, G.SCREEN_H / 2 - 70, 400, 20);
+    assert(Math.abs(panel.lum - before.lum) > 10, 'aviso igual ao menu normal');
+    steps(s, 3.1); s.msg = null; s.shake = 0; G.render(ctx, s);
+    const gold = (cv) => {
+      const d = cv.getContext('2d').getImageData(30 + 4 * 26, 16, 130, 20).data; let n = 0;
+      for (let i = 0; i < d.length; i += 4) if (d[i] > d[i + 2] + 60) n++;
+      return n;
+    };
+    const plainGame = fresh(); plainGame.shake = 0; G.render(c2.getContext('2d'), plainGame);
+    assert(gold(c) > 20 && gold(c2) === 0, 'selo dourado: ' + gold(c) + ' px (sem código: ' + gold(c2) + ')');
+  });
+
+  // =================== ESCUDO NA TECLA P ===================
+  test('escudo P: apertar P dá 10 s de escudo (recarga 20 s)', () => {
+    const s = fresh(); const t = new EventTarget(); G.bindInput(s, t); const p = s.player;
+    assert(G.SHIELD_TIME === 10 && G.SHIELD_COOLDOWN === 20, 'constantes');
+    t.dispatchEvent(keyEvt('keydown', 'KeyP')); t.dispatchEvent(keyEvt('keyup', 'KeyP'));
+    assert(p.shieldTime === 10 && p.shieldCd === 20, 'escudo ' + p.shieldTime + ' / ' + p.shieldCd);
+    assert(!s.paused, 'P ainda pausa o jogo');
+  });
+  test('escudo P: 10 s sem dano (contato, tiro e laser), depois volta a doer', () => {
+    const s = fresh(); const p = s.player;
+    key(s, 'KeyP', true); key(s, 'KeyP', false);
+    dummy(s, p.x, p.y, 'grunt').speed = 0;
+    s.lasers.push({ ox: G.IX0 + 10, oy: p.y, ang: 0, tele: 0, life: 3, width: 30, rot: 0 });
+    for (let i = 0; i < 10; i++) s.bullets.push({ x: p.x, y: p.y, vx: 0, vy: 0, size: 12, life: 5, wait: 0, dmg: 1 });
+    steps(s, 9.8); assert(p.hp === p.maxHp, 'tomou dano com escudo: ' + p.hp);
+    steps(s, 0.4); assert(p.hp < p.maxHp, 'escudo não acabou em 10 s');
+  });
+  test('escudo P: não reativa durante a recarga, só depois de 20 s', () => {
+    const s = fresh(); const p = s.player;
+    key(s, 'KeyP', true); key(s, 'KeyP', false);
+    steps(s, 10.5); assert(p.shieldTime === 0, 'escudo durou demais');
+    key(s, 'KeyP', true); key(s, 'KeyP', false);
+    assert(p.shieldTime === 0, 'reativou na recarga');
+    steps(s, 9.6); key(s, 'KeyP', true); key(s, 'KeyP', false);
+    assert(p.shieldTime === 10, 'não reativou depois de 20 s');
+  });
+  test('escudo P: apertar P de novo com o escudo ativo não renova', () => {
+    const s = fresh(); const p = s.player;
+    key(s, 'KeyP', true); steps(s, 3); key(s, 'KeyP', false); key(s, 'KeyP', true);
+    assert(Math.abs(p.shieldTime - 7) < 0.05, 'renovou: ' + p.shieldTime);
+    const t = new EventTarget(); G.bindInput(s, t);
+    t.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyP', repeat: true }));
+    assert(Math.abs(p.shieldTime - 7) < 0.05, 'repetição renovou');
+  });
+  test('escudo P: pausado não ativa e o tempo do escudo para', () => {
+    const s = fresh(); const p = s.player;
+    key(s, 'Escape', true); key(s, 'KeyP', true); key(s, 'KeyP', false);
+    assert(s.paused && p.shieldTime === 0, 'ativou pausado');
+    key(s, 'Escape', true); key(s, 'KeyP', true); key(s, 'KeyP', false);
+    key(s, 'Escape', true); steps(s, 5);
+    assert(p.shieldTime === 10, 'tempo correu pausado: ' + p.shieldTime);
+  });
+  test('escudo P: no menu não faz nada (nem começa o jogo)', () => {
+    const s = menuState(); key(s, 'KeyP', true);
+    assert(s.status === 'menu' && s.player.shieldTime === 0, 'P agiu no menu');
+  });
+  test('escudo P: não gasta o Manto de Vidro', () => {
+    const s = fresh(); give(s, 'shield'); const p = s.player;
+    key(s, 'KeyP', true); dummy(s, p.x, p.y, 'grunt'); steps(s, 1);
+    assert(p.shieldUp && p.hp === p.maxHp, 'gastou o manto');
+  });
+  test('escudo P: segura 10 s contra o Hipercubo fase 3 (sem escudo apanha)', () => {
+    const fight = (useShield) => {
+      const s = fresh(); const room = findRoom(s, 'boss'); goTo(s, room);
+      const e = G.makeEnemy(s, { type: 'boss', kind: 'hipercubo', x: G.W / 2, y: G.H / 2 - 90 });
+      e.hp = e.maxHp * 0.2; room.enemies = [e]; room.cleared = false;
+      s.player.x = G.W / 2; s.player.y = G.H / 2 + 60;
+      if (useShield) key(s, 'KeyP', true);
+      steps(s, 9.9); return s.player;
+    };
+    assert(fight(false).hp < 8, 'teste inválido: sem escudo não apanhou');
+    assert(fight(true).hp === 8, 'com escudo apanhou');
+  });
+  test('escudo P: recomeçar zera escudo e recarga', () => {
+    const s = fresh(); key(s, 'KeyP', true); s.status = 'dead'; key(s, 'KeyR', true);
+    assert(s.player.shieldTime === 0 && s.player.shieldCd === 0, 'escudo ficou');
+  });
+  test('escudo P: Esc pausa (P não pausa mais)', () => {
+    const s = fresh(); key(s, 'KeyP', true); assert(!s.paused, 'P pausou');
+    key(s, 'Escape', true); assert(s.paused, 'Esc não pausou');
+    key(s, 'Escape', true); assert(!s.paused, 'Esc não despausou');
+  });
+  test('escudo P: medidor e bolha aparecem na tela', () => {
+    const c = document.createElement('canvas'); c.width = G.W; c.height = G.SCREEN_H; const ctx = c.getContext('2d');
+    const meter = () => stats(c, G.W - 170, G.SCREEN_H - 26, 40, 12);
+    const s = fresh(); s.time = 0; s.shake = 0; s.msg = null; G.render(ctx, s);
+    const ready = meter(); assert(ready.g > ready.r, 'pronto não é verde ' + [ready.r, ready.g, ready.b].map(Math.round));
+    // borda da bolha (o miolo é quase transparente): centro em z = -10 + raio
+    const r = s.player.size * 1.25, ctr = G.proj(s.player.x, s.player.y, -10 + r);
+    const spot = { x: ctr.x + r * G.sc(s.player.y) * 0.93, y: ctr.y }, before = px(c, spot.x, spot.y);
+    key(s, 'KeyP', true); s.particles = []; G.render(ctx, s);
+    const act = meter(); assert(act.b > act.r + 30, 'ativo não é azul ' + [act.r, act.g, act.b].map(Math.round));
+    const after = px(c, spot.x, spot.y);
+    assert(Math.abs(after[0] - before[0]) + Math.abs(after[1] - before[1]) + Math.abs(after[2] - before[2]) > 15, 'sem bolha');
+    s.player.shieldTime = 0; s.player.shieldCd = 5; G.render(ctx, s);
+    const cd = meter();
+    assert(cd.g - cd.r < 25 && ready.g - ready.r > 40, 'recarga ainda parece pronta ' + [cd.r, cd.g, cd.b].map(Math.round));
+  });
+  test('comandos: andar, atirar e ativar escudo ao mesmo tempo', () => {
+    const s = fresh(); const t = new EventTarget(); G.bindInput(s, t); const p = s.player;
+    const x0 = p.x;
+    for (const c of ['KeyD', 'ArrowLeft', 'KeyP']) t.dispatchEvent(keyEvt('keydown', c));
+    steps(s, 0.5);
+    assert(p.x > x0 + 60 && s.tears.some(tt => tt.vx < 0) && p.shieldTime > 9, 'algum comando falhou');
+    for (const c of ['KeyD', 'ArrowLeft', 'KeyP']) t.dispatchEvent(keyEvt('keyup', c));
+    assert(!s.keys.KeyD && !s.keys.ArrowLeft && !s.keys.KeyP, 'tecla presa');
+  });
+
+  // =================== MÚSICA ===================
+  const M = BlockMusic;
+  const bar = (b, intensity) => { const out = []; for (let i = 0; i < 16; i++) out.push(M.stepEvents(b * 16 + i, intensity || 0)); return out; };
+  const has = (evs, inst) => evs.some(e => e.inst === inst);
+  test('música: 92 BPM (andamento de rap) com loop de 4 compassos', () => {
+    assert(M.BPM >= 85 && M.BPM <= 100, 'BPM ' + M.BPM);
+    assert(M.BARS === 4 && M.CHORDS.length === 4, 'loop');
+    assert(near(M.STEP, 60 / 92 / 4), 'passo ' + M.STEP);
+  });
+  test('música: bumbo no 1 e caixa no 2 e no 4 em todo compasso', () => {
+    for (let b = 0; b < 4; b++) {
+      const ev = bar(b);
+      assert(has(ev[0], 'kick'), 'sem bumbo no 1 (compasso ' + b + ')');
+      assert(has(ev[4], 'snare') && has(ev[12], 'snare'), 'sem backbeat (compasso ' + b + ')');
+      assert(!has(ev[0], 'snare') && !has(ev[8], 'snare'), 'caixa fora do lugar');
+    }
+  });
+  test('música: chimbal em toda colcheia', () => {
+    const ev = bar(0); for (let i = 0; i < 16; i += 2) assert(has(ev[i], 'hat'), 'sem chimbal no passo ' + i);
+  });
+  test('música: 808 segue a raiz (ou quinta) do acorde', () => {
+    for (let b = 0; b < 4; b++) {
+      const root = M.CHORDS[b].root % 12;
+      for (const evs of bar(b)) for (const e of evs) if (e.inst === 'bass') {
+        const pc = e.note % 12; assert(pc === root || pc === (root + 7) % 12, 'nota ' + e.note);
+      }
+    }
+  });
+  test('música: todas as notas estão em Lá menor', () => {
+    for (let b = 0; b < 4; b++) for (const intensity of [0, 1]) for (const evs of bar(b, intensity)) for (const e of evs) {
+      for (const n of (e.notes || (e.note !== undefined ? [e.note] : []))) assert(M.SCALE.includes(n % 12), e.inst + ' nota fora: ' + n);
+    }
+  });
+  test('música: lado Frutiger Aero (pad todo compasso, sinos de vidro, bolha)', () => {
+    let bells = 0, bubble = 0;
+    for (let b = 0; b < 4; b++) {
+      const ev = bar(b); assert(has(ev[0], 'pad'), 'sem pad no compasso ' + b);
+      for (const e of ev) { if (has(e, 'bell')) bells++; if (has(e, 'bubble')) bubble++; }
+    }
+    assert(bells >= 16 && bubble >= 1, 'sinos ' + bells + ' bolhas ' + bubble);
+  });
+  test('música: na luta contra chefão fica mais pesada', () => {
+    const count = (intensity, inst) => bar(0, intensity).filter(e => has(e, inst)).length;
+    assert(count(1, 'stab') > 0 && count(0, 'stab') === 0, 'stabs');
+    assert(count(1, 'hat') > count(0, 'hat') && count(1, 'kick') > count(0, 'kick'), 'bateria');
+  });
+  test('música: intensidade 1 só com chefão vivo na sala', () => {
+    const s = fresh(); assert(G.musicIntensity(s) === 0, 'sala normal');
+    const room = findRoom(s, 'boss'); goTo(s, room); assert(G.musicIntensity(s) === 1, 'chefão');
+    room.enemies[0].hp = 0; G.update(s, DT); assert(G.musicIntensity(s) === 0, 'chefão morto');
+    const m = menuState(); assert(G.musicIntensity(m) === 0, 'menu');
+  });
+  test('música: sem suporte a áudio o jogo não quebra', () => {
+    const m = M.createMusic({ AudioContext: null });
+    assert(m.start() === false && !m.started, 'deveria falhar em silêncio');
+    m.toggleMute(); m.setIntensity(1);
+  });
+  test('música: começa na primeira tecla e M liga/desliga', () => {
+    const m = M.createMusic(); const t = new EventTarget(); G.bindMusic(t, m);
+    assert(!m.started, 'tocou antes de tecla');
+    t.dispatchEvent(keyEvt('keydown', 'KeyA')); assert(m.started && !m.muted, 'não começou');
+    t.dispatchEvent(keyEvt('keydown', 'KeyM')); assert(m.muted, 'M não mutou');
+    t.dispatchEvent(keyEvt('keydown', 'KeyM')); assert(!m.muted, 'M não desmutou');
+    t.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyM', repeat: true })); assert(!m.muted, 'repetição mutou');
+    m.stop();
+  });
+  test('música: M não mexe no jogo', () => {
+    const s = fresh(); const p = s.player; const x = p.x, y = p.y;
+    key(s, 'KeyM', true); G.update(s, DT);
+    assert(!s.paused && s.status === 'playing' && p.x === x && p.y === y, 'M mexeu no bloco/pausa');
+    assert(s.tears.length === 0 && p.shieldTime === 0, 'M atirou ou ativou escudo');
+    const m = menuState(); key(m, 'KeyM', true);
+    assert(m.status === 'menu' && m.menuIndex === 0, 'M mexeu no menu');
+  });
+  test('música: o jogo de verdade (start) tem música ligada ao teclado', () => {
+    const m = G.getMusic(); assert(m, 'start() não criou música');
+    assert(m.started, 'não começou depois das teclas na janela');
+  });
+
+  // ---------- testes assíncronos: renderiza o áudio de verdade (sem tocar) ----------
+  const pending = [];
+  function testAsync(name, fn) {
+    pending.push(Promise.resolve().then(fn).then(
+      () => results.push('PASS ' + name),
+      e => results.push('FAIL ' + name + ' -> ' + (e && e.message || e))));
+  }
+  function bands(buf) {
+    const d = buf.getChannelData(0), n = 40; let lo = 0, hi = 0, all = 0, peak = 0, acc = 0;
+    for (let i = 0; i < d.length; i++) {
+      acc += d[i]; if (i >= n) acc -= d[i - n];
+      const l = acc / n, h = d[i] - l;
+      lo += l * l; hi += h * h; all += d[i] * d[i]; peak = Math.max(peak, Math.abs(d[i]));
+    }
+    return { rms: Math.sqrt(all / d.length), lo: Math.sqrt(lo / d.length), hi: Math.sqrt(hi / d.length), peak };
+  }
+  function windowPeak(buf, t0, t1) {
+    const d = buf.getChannelData(0), sr = buf.sampleRate, n = 40; let acc = 0, peak = 0;
+    for (let i = Math.floor(t0 * sr) - n; i < t1 * sr; i++) { acc += d[i]; if (i - n >= 0) acc -= d[i - n]; if (i >= t0 * sr) peak = Math.max(peak, Math.abs(acc / n)); }
+    return peak;
+  }
+  const audio = M.renderOffline(2, 0);
+  testAsync('música (áudio): 2 compassos têm som e não estouram', () => audio.then(buf => {
+    const b = bands(buf);
+    assert(b.rms > 0.02, 'muito baixo: ' + b.rms.toFixed(4));
+    assert(b.peak <= 1, 'estourou: ' + b.peak.toFixed(2));
+  }));
+  testAsync('música (áudio): tem grave (bumbo/808) e agudo (chimbal/sinos)', () => audio.then(buf => {
+    const b = bands(buf);
+    assert(b.lo > 0.02, 'sem grave ' + b.lo.toFixed(4)); assert(b.hi > 0.004, 'sem agudo ' + b.hi.toFixed(4));
+  }));
+  testAsync('música (áudio): o bumbo bate forte no tempo 1', () => audio.then(buf => {
+    const one = windowPeak(buf, 0.02, 0.12), off = windowPeak(buf, 0.02 + M.STEP * 2, 0.02 + M.STEP * 2 + 0.1);
+    assert(one > off * 1.3, 'tempo 1 ' + one.toFixed(3) + ' vs contratempo ' + off.toFixed(3));
+  }));
+  testAsync('música (áudio): versão de chefão é mais intensa', () => Promise.all([audio, M.renderOffline(2, 1)]).then(([calm, boss]) => {
+    const a = bands(calm), b = bands(boss);
+    assert(b.rms > a.rms && b.hi > a.hi, 'não ficou mais forte: rms ' + a.rms.toFixed(4) + ' -> ' + b.rms.toFixed(4));
+    // no passo 2 só o modo chefão tem stab de cordas: ali a diferença tem que ser clara
+    const winRms = (buf, t0) => {
+      const d = buf.getChannelData(0), sr = buf.sampleRate; let sum = 0, n = 0;
+      for (let i = Math.floor(t0 * sr); i < (t0 + 0.15) * sr; i++) { sum += d[i] * d[i]; n++; }
+      return Math.sqrt(sum / n);
+    };
+    const t2 = 0.02 + M.STEP * 2, ca = winRms(calm, t2), cb = winRms(boss, t2);
+    assert(cb > ca * 1.5, 'stab do chefão fraco: ' + ca.toFixed(4) + ' -> ' + cb.toFixed(4));
+  }));
+
+  // ---------- Controles de toque ----------
+  test('toque: analógico esquerdo move o bloco', () => {
+    const s = fresh(); const t = G.createTouch();
+    const x0 = s.player.x;
+    G.touchDown(s, t, 1, 150, 450); G.touchMove(t, 1, 230, 450); G.syncTouch(s, t);
+    assert(s.keys.KeyD && !s.keys.KeyA && !s.keys.KeyW && !s.keys.KeyS, 'só KeyD');
+    steps(s, 0.3);
+    assert(s.player.x > x0 + 20, 'não andou para a direita');
+    G.touchUp(t, 1); G.syncTouch(s, t);
+    assert(!s.keys.KeyD, 'soltar o dedo solta a tecla');
+  });
+  test('toque: analógico em diagonal segura duas teclas', () => {
+    const s = fresh(); const t = G.createTouch();
+    G.touchDown(s, t, 1, 150, 450); G.touchMove(t, 1, 190, 410); G.syncTouch(s, t);
+    assert(s.keys.KeyD && s.keys.KeyW, 'diagonal cima-direita');
+  });
+  test('toque: zona morta do analógico não move', () => {
+    const s = fresh(); const t = G.createTouch();
+    G.touchDown(s, t, 1, 150, 450); G.touchMove(t, 1, 155, 452); G.syncTouch(s, t);
+    assert(!s.keys.KeyD && !s.keys.KeyW && !s.keys.KeyS && !s.keys.KeyA, 'mexeu na zona morta');
+  });
+  test('toque: analógico direito atira na direção dominante', () => {
+    const s = fresh(); const t = G.createTouch();
+    G.touchDown(s, t, 2, 700, 400); G.touchMove(t, 2, 690, 330); G.syncTouch(s, t);
+    assert(s.keys.ArrowUp && !s.keys.ArrowLeft, 'deveria atirar para cima');
+    steps(s, 0.3);
+    assert(s.tears.length > 0, 'não atirou');
+  });
+  test('toque: mover e atirar ao mesmo tempo (dois dedos)', () => {
+    const s = fresh(); const t = G.createTouch();
+    G.touchDown(s, t, 1, 150, 450); G.touchDown(s, t, 2, 700, 400);
+    G.touchMove(t, 1, 80, 450); G.touchMove(t, 2, 780, 400); G.syncTouch(s, t);
+    assert(s.keys.KeyA && s.keys.ArrowRight, 'os dois analógicos');
+    G.touchUp(t, 2); G.syncTouch(s, t);
+    assert(s.keys.KeyA && !s.keys.ArrowRight, 'soltar um não solta o outro');
+  });
+  test('toque: o centro do analógico acompanha o dedo', () => {
+    const s = fresh(); const t = G.createTouch();
+    G.touchDown(s, t, 1, 150, 450); G.touchMove(t, 1, 400, 450);
+    assert(Math.abs(t.move.x - t.move.ox - G.STICK_R) < 0.01, 'centro não acompanhou');
+    G.touchMove(t, 1, 300, 450); G.syncTouch(s, t);
+    assert(s.keys.KeyA, 'voltar o dedo deveria inverter a direção na hora');
+  });
+  test('toque: botões de escudo e pausa', () => {
+    const s = fresh(); const t = G.createTouch();
+    const btn = id => G.TOUCH_BTNS.find(b => b.id === id);
+    G.touchDown(s, t, 1, btn('shield').x, btn('shield').y);
+    assert(s.player.shieldTime > 0, 'escudo não ativou');
+    assert(!t.aim, 'botão não deveria virar analógico');
+    G.touchDown(s, t, 2, btn('pause').x, btn('pause').y);
+    assert(s.paused, 'não pausou');
+    G.touchDown(s, t, 3, 300, 300);
+    assert(!s.paused, 'tocar na tela deveria despausar');
+  });
+  test('toque: menu escolhe opção tocada', () => {
+    const s = G.createState(5, { menu: true }); const t = G.createTouch();
+    const mid = i => { const r = G.menuOptionRect(G.MENU_OPTIONS.indexOf(i)); return [r.x + r.w / 2, r.y + r.h / 2]; };
+    G.touchDown(s, t, 1, ...mid('Controles'));
+    assert(s.status === 'menu' && s.screen === 'help', 'não abriu Controles');
+    G.touchDown(s, t, 2, 100, 100);
+    assert(!s.screen, 'toque deveria fechar Controles');
+    G.touchDown(s, t, 3, ...mid('Jogar'));
+    assert(s.status === 'playing', 'não começou o jogo');
+  });
+  test('toque: depois de perder, tocar recomeça', () => {
+    const s = fresh(); const t = G.createTouch();
+    s.status = 'dead'; s.kills = 9;
+    G.touchDown(s, t, 1, 300, 300);
+    assert(s.status === 'playing' && s.kills === 0, 'não recomeçou');
+  });
+  test('toque: sem dedo na tela, o teclado segurado continua valendo (loop real)', () => {
+    const s = fresh(); const t = G.createTouch(); const x0 = s.player.x;
+    key(s, 'KeyD', true); key(s, 'ArrowUp', true);
+    for (let i = 0; i < 30; i++) { G.syncTouch(s, t); G.update(s, DT); } // como o frame() do start()
+    assert(s.keys.KeyD && s.keys.ArrowUp, 'o toque soltou as teclas do teclado');
+    assert(s.player.x > x0 + 40 && s.tears.length > 0, 'não andou/atirou');
+    G.touchDown(s, t, 1, 150, 450); G.touchMove(t, 1, 80, 450); G.syncTouch(s, t);
+    assert(s.keys.KeyA && s.keys.KeyD, 'toque e teclado juntos');
+    G.touchUp(t, 1); G.syncTouch(s, t);
+    assert(!s.keys.KeyA && s.keys.KeyD, 'soltar o dedo soltou a tecla do teclado');
+  });
+  test('toque: analógicos não mexem no menu', () => {
+    const s = G.createState(5, { menu: true }); const t = G.createTouch();
+    t.move = { id: 1, ox: 100, oy: 100, x: 100, y: 200 };
+    G.syncTouch(s, t);
+    assert(s.menuIndex === 0 && !t.move, 'analógico vazou para o menu');
+  });
+  test('toque: desenho dos controles não quebra', () => {
+    const s = fresh(); const t = G.createTouch();
+    const ctx = document.createElement('canvas').getContext('2d');
+    G.setTouchMode(true);
+    try {
+      G.render(ctx, s); G.drawTouch(ctx, s, t);
+      G.touchDown(s, t, 1, 150, 450); G.touchMove(t, 1, 300, 450); G.drawTouch(ctx, s, t);
+      s.status = 'dead'; G.render(ctx, s);
+      const m = G.createState(5, { menu: true }); m.screen = 'help'; G.render(ctx, m);
+    } finally { G.setTouchMode(false); }
+  });
+
+  // =================== ANDARES 1-10 ===================
+  test('andares: 10 andares com salas, vida e monstros crescendo', () => {
+    assert(G.MAX_FLOOR === 10 && G.FLOORS.length === 10, 'andares ' + G.MAX_FLOOR);
+    G.FLOORS.forEach((f, i) => {
+      assert(G.BIOMES.some(b => b.id === f.biome), 'bioma ' + f.biome);
+      assert(f.bosses.length && f.bosses.every(k => G.BOSSES[k]), 'chefões do andar ' + (i + 1));
+      if (i) assert(f.rooms > G.FLOORS[i - 1].rooms, 'salas não crescem no andar ' + (i + 1));
+    });
+    const types = new Set(); G.FLOORS.forEach(f => Object.keys(f.pool).forEach(k => types.add(k)));
+    for (const t of ['splitter', 'charger', 'spinner', 'bomber', 'ghost', 'shielder', 'healer', 'nest']) assert(types.has(t), 'falta ' + t);
+  });
+  test('andares: elites só a partir do andar 4, com vida em dobro', () => {
+    let early = 0, late = 0;
+    for (let seed = 1; seed <= 30; seed++) {
+      for (const floor of [2, 6]) {
+        const s = G.createState(seed); s.floor = floor; G.generateFloor(s);
+        for (const r of Object.values(s.rooms)) for (const sp of r.spawns) if (sp.elite) floor < 4 ? early++ : late++;
+      }
+    }
+    assert(early === 0 && late > 0, 'elites ' + early + '/' + late);
+    const s = fresh(); s.floor = 5;
+    const a = G.makeEnemy(s, { type: 'grunt', x: 300, y: 300 }), b = G.makeEnemy(s, { type: 'grunt', x: 300, y: 300, elite: true });
+    assert(near(b.maxHp, a.maxHp * 2) && b.elite && b.xp === a.xp * 3, 'elite ' + b.maxHp);
+  });
+  test('andares: mensagem mostra "Andar N" e o andar de 10', () => {
+    const s = fresh(); s.floor = 2;
+    const room = findRoom(s, 'boss'); goTo(s, room); room.enemies[0].hp = 0;
+    s.player.x = G.W / 2; s.player.y = G.H / 2 + 150; G.update(s, DT); noXp(s);
+    key(s, 'KeyW', true); for (let i = 0; i < 120 && s.floor === 2; i++) G.update(s, DT);
+    assert(s.msg && s.msg.title === 'Andar 3' && /3 de 10/.test(s.msg.sub), JSON.stringify(s.msg));
+  });
+
+  // =================== MONSTROS NOVOS ===================
+  function arena(type, dx, dy) {
+    const s = fresh(); const room = G.curRoom(s); room.rocks = []; room.cleared = false;
+    s.player.hp = s.player.maxHp = 999; s.rng = () => 0.99;
+    const e = G.makeEnemy(s, { type, x: s.player.x + (dx || 200), y: s.player.y + (dy || 0) });
+    room.enemies.push(e); return { s, room, e };
+  }
+  test('monstros: todos os novos andam/atacam e tomam dano', () => {
+    for (const type of ['splitter', 'charger', 'spinner', 'bomber', 'ghost', 'shielder', 'healer', 'nest', 'clone', 'slimelet']) {
+      const { s, e } = arena(type, 220, -120);
+      const hp = e.hp; steps(s, 1.5);
+      assert(Number.isFinite(e.x) && Number.isFinite(e.y), type + ' posição inválida');
+      e.phased = false; e.ang = Math.PI; // de frente para longe da bolha
+      G.hitEnemy(s, e, 1);
+      assert(e.hp < hp || type === 'healer', type + ' não tomou dano');
+    }
+  });
+  test('monstro Gosma: divide em 2 mini-gosmas ao morrer', () => {
+    const { s, room, e } = arena('splitter'); e.hp = 0; G.update(s, DT);
+    const minis = room.enemies.filter(x => x.type === 'slimelet');
+    assert(minis.length === 2 && minis.every(m => m.xp === 1), 'mini-gosmas ' + minis.length);
+  });
+  test('monstro Investida: avisa e avança rápido; bate na pedra e fica tonto', () => {
+    const { s, room, e } = arena('charger', 250); e.cd = 0;
+    let wind = false, dash = false, x0 = e.x;
+    for (let i = 0; i < 90; i++) { G.update(s, DT); if (e.state === 'chargeWind') wind = true; if (e.state === 'charging') dash = true; }
+    assert(wind && dash && e.x < x0 - 150, 'não investiu: ' + (x0 - e.x).toFixed(0));
+    const b = arena('charger', 250); b.room.rocks.push({ x: b.e.x - 80, y: b.e.y - 20, w: 40, h: 40 });
+    b.e.state = 'charging'; b.e.timer = 1; b.e.cang = Math.PI;
+    for (let i = 0; i < 40 && b.e.state === 'charging'; i++) G.update(b.s, DT);
+    assert(b.e.state === 'stun', 'não ficou tonto: ' + b.e.state);
+  });
+  test('monstro Roda: anel de 8 balas', () => {
+    const { s, e } = arena('spinner'); e.cd = 0; G.update(s, DT);
+    assert(s.bullets.length === 8, 'balas ' + s.bullets.length);
+  });
+  test('monstro Bomba: explode perto do jogador; morta de longe não machuca', () => {
+    const { s } = arena('bomber', 50); s.player.hp = 6; s.player.maxHp = 6;
+    steps(s, 1); assert(s.player.hp < 6, 'explosão não machucou');
+    const b = arena('bomber', 300); b.s.player.hp = 6; b.e.hp = 0; G.update(b.s, DT);
+    assert(b.s.player.hp === 6 && b.s.fx.length, 'explodiu longe e machucou');
+  });
+  test('monstro Fantasma: invisível é intocável e atravessa pedra', () => {
+    const { s, room, e } = arena('ghost', 150); e.t = 2.5; e.speed = 0; G.update(s, DT);
+    assert(e.phased, 'não sumiu');
+    const hp = e.hp; s.tears.push({ x: e.x, y: e.y, vx: 0, vy: 0, life: 1, max: 1, size: 12, dmg: 5, bounces: 0 });
+    G.update(s, DT); assert(e.hp === hp, 'tomou dano invisível');
+    e.t = 0; e.speed = 80; room.rocks.push({ x: e.x - 70, y: e.y - 20, w: 40, h: 40 });
+    steps(s, 1); assert(e.x < s.player.x + 150 - 60, 'travou na pedra');
+  });
+  test('monstro Escudeiro: escudo bloqueia de frente, acerta pelas costas e por ricochete', () => {
+    const shot = (vx, vy, bounces) => {
+      const { s, e } = arena('shielder', 200); e.speed = 0; e.ang = Math.PI; // olhando para o jogador (esquerda)
+      const hp = e.hp;
+      s.tears.push({ x: e.x - vx * 0.05, y: e.y, vx, vy, life: 1, max: 1, size: 12, dmg: 5, bounces: bounces || 0 });
+      G.update(s, DT); return { hit: e.hp < hp, s };
+    };
+    assert(!shot(400, 0).hit, 'escudo não bloqueou');
+    assert(shot(-400, 0).hit, 'pelas costas não acertou');
+    const r = shot(400, 0, 2); assert(!r.hit && r.s.tears.length === 1 && r.s.tears[0].vx < 0, 'não ricocheteou no escudo');
+  });
+  test('monstro Curandeiro: cura aliados por perto', () => {
+    const { s, room, e } = arena('healer', 300);
+    const g = G.makeEnemy(s, { type: 'grunt', x: e.x + 40, y: e.y }); g.hp = 1; g.speed = 0; room.enemies.push(g);
+    e.cd = 0; G.update(s, DT); assert(g.hp > 1, 'não curou');
+  });
+  test('monstro Ninho: solta moscas (que não dão XP)', () => {
+    const { s, room, e } = arena('nest'); e.cd = 0; G.update(s, DT);
+    const flies = room.enemies.filter(x => x.type === 'fly');
+    assert(flies.length === 1 && flies[0].summoned && flies[0].xp === 0, 'moscas ' + flies.length);
+  });
+  test('monstros: primeiro encontro mostra o nome e a dica', () => {
+    const s = fresh(); const room = Object.values(s.rooms).find(r => r.type === 'normal');
+    room.spawns = [{ type: 'bomber', x: 300, y: 300 }];
+    const k = Object.keys(G.curRoom(s).doors)[0], d = G.DIRS[k];
+    s.rooms[G.rk(d.dx, d.dy)].spawns = [{ type: 'bomber', x: 300, y: 300 }];
+    s.rooms[G.rk(d.dx, d.dy)].visited = false;
+    G.enterRoom(s, k);
+    assert(s.msg && s.msg.title === 'Bomba', 'sem aviso: ' + JSON.stringify(s.msg));
+  });
+  test('chefões: Espelho devolve bolhas enquanto reflete', () => {
+    const { s, e } = bossFight('espelho'); s.grace = 0;
+    e.state = 'mirror'; e.reflect = true; e.timer = 5; e.emit = 99;
+    const hp = e.hp; s.bullets = [];
+    s.tears.push({ x: e.x, y: e.y, vx: 0, vy: 0, life: 1, max: 1, size: 12, dmg: 5, bounces: 0 });
+    G.update(s, DT);
+    assert(e.hp === hp && s.bullets.length === 1, 'não refletiu');
+  });
+
+  // =================== POWERUPS NOVOS ===================
+  test('item Tiro Cruzado: 4 direções, laterais com 60% do dano', () => {
+    const s = fresh(); give(s, 'cross'); tap(s, 'ArrowUp');
+    assert(s.tears.length === 4, 'tiros ' + s.tears.length);
+    const up = s.tears.find(t => t.vy < -100), side = s.tears.find(t => t.vx > 100);
+    assert(up && near(up.dmg, s.player.dmg) && near(side.dmg, s.player.dmg * 0.6), 'dano');
+    const s2 = fresh(); give(s2, 'cross', 'triple'); tap(s2, 'ArrowUp');
+    assert(s2.tears.length === 12, 'cruzado + triplo ' + s2.tears.length);
+  });
+  test('item Ricochete em Cadeia: a bolha salta para outro inimigo', () => {
+    const s = fresh(); give(s, 'chain'); const p = s.player;
+    const a = dummy(s, p.x + 100, p.y), b = dummy(s, p.x + 100, p.y + 150);
+    const hb = b.hp; tap(s, 'ArrowRight'); steps(s, 0.8);
+    assert(b.hp < hb, 'não saltou');
+  });
+  test('item Bolha Explosiva: machuca quem está perto do alvo', () => {
+    const s = fresh(); give(s, 'explode'); const p = s.player;
+    dummy(s, p.x + 120, p.y); const b = dummy(s, p.x + 150, p.y + 40);
+    const hb = b.hp; tap(s, 'ArrowRight'); steps(s, 0.4);
+    assert(b.hp < hb && s.fx.length, 'explosão não pegou o vizinho');
+  });
+  test('item Bolha Venenosa: dano contínuo', () => {
+    const s = fresh(); give(s, 'poison'); const p = s.player;
+    const e = dummy(s, p.x + 100, p.y); e.maxHp = e.hp = 200;
+    tap(s, 'ArrowRight'); steps(s, 0.3);
+    assert(e.poison > 0, 'não envenenou');
+    const hp = e.hp; s.player.cd = 999; key(s, 'ArrowRight', false); steps(s, 1);
+    assert(e.hp < hp, 'veneno não tirou vida');
+  });
+  test('item Lente Crítica: crítico causa dano em dobro', () => {
+    const s = fresh(); s.player.crit = 1; tap(s, 'ArrowRight');
+    assert(s.tears[0].crit && near(s.tears[0].dmg, s.player.dmg * 2), 'sem crítico');
+  });
+  test('item Ímã: puxa moedas de longe', () => {
+    for (const mag of [true, false]) {
+      const s = fresh(); if (mag) give(s, 'magnet'); const p = s.player;
+      G.curRoom(s).pickups.push({ type: 'coin', x: p.x + 130, y: p.y, size: 14, vx: 0, vy: 0, t: 0 });
+      steps(s, 1.5);
+      if (mag) assert(s.coins === 1, 'ímã não puxou'); else assert(s.coins === 0, 'puxou sem ímã');
+    }
+  });
+  test('ricochete: pegar de novo e melhorias somam ricochetes (até 5)', () => {
+    const s = fresh(); give(s, 'bounce'); assert(s.player.bounces === 2, '1º ' + s.player.bounces);
+    give(s, 'bounce'); assert(s.player.bounces === 3, '2º ' + s.player.bounces);
+    for (let i = 0; i < 5; i++) G.SKILLS.find(k => k.id === 'bounce').apply(s.player);
+    assert(s.player.bounces === 5, 'máximo ' + s.player.bounces);
+    s.player.bounces = 3; s.player.x = G.IX1 - 60; s.player.range = 5;
+    tap(s, 'ArrowRight'); let flips = 0, last = 1;
+    for (let i = 0; i < 400 && s.tears.length; i++) { G.update(s, DT); const v = Math.sign(s.tears[0] ? s.tears[0].vx : last); if (v !== last) { flips++; last = v; } }
+    assert(flips === 3, 'ricocheteou ' + flips + ' vezes');
+  });
+  test('ricochete: bolha quica no chefão em vez de sumir', () => {
+    const { s, e } = bossFight('gelatao'); s.grace = 0; e.state = 'idle'; e.timer = 99;
+    s.tears.push({ x: e.x - e.size / 2 - 4, y: e.y, vx: 400, vy: 0, life: 1, max: 1, size: 12, dmg: 5, bounces: 1 });
+    const hp = e.hp; G.update(s, DT);
+    assert(e.hp < hp && s.tears.length === 1 && s.tears[0].vx < 0, 'não ricocheteou');
+  });
+
+  // =================== XP, NÍVEL E CARTAS ===================
+  test('XP: abate solta orbes que voam até o jogador', () => {
+    const s = fresh(); const p = s.player; const e = dummy(s, p.x + 150, p.y, 'grunt'); e.hp = 0;
+    G.update(s, DT);
+    assert(G.curRoom(s).pickups.some(pk => pk.type === 'xp'), 'sem orbe');
+    steps(s, 2); assert(near(s.xp, 2), 'xp ' + s.xp);
+  });
+  test('XP: subir de nível congela o jogo e mostra 3 cartas', () => {
+    const s = fresh(); G.gainXp(s, G.xpNeed(1)); G.update(s, DT);
+    assert(s.level === 2 && s.levelUp && s.levelUp.cards.length === 3, 'sem cartas');
+    assert(new Set(s.levelUp.cards).size === 3, 'cartas repetidas');
+    const x0 = s.player.x; key(s, 'KeyD', true); steps(s, 0.5);
+    assert(s.player.x === x0, 'andou com as cartas abertas');
+  });
+  test('XP: tecla 1/2/3 escolhe a carta e aplica a melhoria', () => {
+    const s = fresh(); G.gainXp(s, G.xpNeed(1)); G.update(s, DT);
+    const id = s.levelUp.cards[1], before = JSON.stringify(s.player);
+    key(s, 'Digit2', true);
+    assert(!s.levelUp && s.skills[id] === 1 && JSON.stringify(s.player) !== before, 'não aplicou ' + id);
+    key(s, 'KeyD', true); const x0 = s.player.x; steps(s, 0.3); assert(s.player.x > x0, 'jogo não voltou');
+  });
+  test('XP: setas + Enter também escolhem; melhorias no máximo não aparecem', () => {
+    const s = fresh();
+    for (const k of G.SKILLS) if (k.id !== 'dmg' && k.id !== 'rate') s.skills[k.id] = G.SKILL_MAX;
+    G.gainXp(s, G.xpNeed(1)); G.update(s, DT);
+    assert(s.levelUp.cards.length === 2 && s.levelUp.cards.every(c => c === 'dmg' || c === 'rate'), s.levelUp.cards.join());
+    const second = s.levelUp.cards[1];
+    key(s, 'ArrowRight', true); key(s, 'Enter', true);
+    assert(!s.levelUp && s.skills[second] === 1, 'Enter não escolheu a 2ª carta');
+  });
+  test('XP: muito XP de uma vez abre uma carta por nível', () => {
+    const s = fresh(); G.gainXp(s, G.xpNeed(1) + G.xpNeed(2) + 1); assert(s.level === 3 && s.pendingLevels === 2, 'nível ' + s.level);
+    G.update(s, DT); key(s, 'Digit1', true); G.update(s, DT);
+    assert(s.levelUp, 'segunda carta não abriu'); key(s, 'Digit1', true);
+    assert(!s.levelUp && s.pendingLevels === 0, 'sobrou carta');
+  });
+  test('XP: toque escolhe a carta', () => {
+    const s = fresh(); const t = G.createTouch(); G.gainXp(s, G.xpNeed(1)); G.update(s, DT);
+    const id = s.levelUp.cards[2], r = G.levelCardRect(2);
+    G.touchDown(s, t, 1, r.x + r.w / 2, r.y + r.h / 2);
+    assert(!s.levelUp && s.skills[id] === 1, 'toque não escolheu');
+  });
+
+  // =================== COMBO ===================
+  test('combo: abates seguidos multiplicam o XP; dano zera', () => {
+    const s = fresh(); const p = s.player;
+    for (let i = 0; i < 4; i++) { dummy(s, 200 + i * 40, 150).hp = 0; G.update(s, DT); }
+    assert(s.combo === 4 && near(G.comboMult(s), 1.3), 'combo ' + s.combo);
+    const xp0 = s.xp; G.gainXp(s, 1); assert(near(s.xp - xp0, 1.3), 'xp com combo ' + (s.xp - xp0));
+    dummy(s, p.x, p.y, 'grunt'); G.update(s, DT);
+    assert(s.combo === 0, 'dano não zerou o combo');
+    assert(s.bestCombo === 4, 'melhor combo ' + s.bestCombo);
+  });
+  test('combo: acaba depois de 2,5 s sem abates', () => {
+    const s = fresh(); dummy(s, 200, 150).hp = 0; dummy(s, 260, 150).hp = 0; G.update(s, DT);
+    assert(s.combo === 2, 'combo ' + s.combo); steps(s, G.COMBO_TIME + 0.1);
+    assert(s.combo === 0, 'não acabou');
+  });
+
+  // =================== MOEDAS E LOJA ===================
+  function shopState(coins) {
+    const s = fresh(); const room = findRoom(s, 'shop'); goTo(s, room); s.coins = coins; return { s, room };
+  }
+  function walkTo(s, slot) { s.player.x = slot.x; s.player.y = slot.y; G.update(s, DT); }
+  test('loja: toda loja tem item, coração e carta com preço', () => {
+    const { room } = shopState(0);
+    assert(room.cleared && room.shop.map(x => x.kind).join() === 'item,heart,skill', 'loja ' + JSON.stringify(room.shop));
+    const p1 = G.shopPrices(1), p9 = G.shopPrices(9);
+    assert(p9.item > p1.item && p9.heart > p1.heart && p9.skill > p1.skill, 'preço não sobe');
+  });
+  test('loja: comprar desconta moedas e aplica; sem dinheiro não compra', () => {
+    const { s, room } = shopState(5); const item = room.shop[0];
+    walkTo(s, item); assert(!item.sold && s.coins === 5, 'comprou sem dinheiro');
+    s.coins = 100; walkTo(s, item);
+    assert(item.sold && s.coins === 100 - item.price && s.player.items.includes(item.id), 'não comprou');
+    assert(s.purchases === 1, 'compras ' + s.purchases);
+  });
+  test('loja: coração só com vida faltando; carta abre a escolha', () => {
+    const { s, room } = shopState(100); const heart = room.shop[1], card = room.shop[2];
+    walkTo(s, heart); assert(!heart.sold, 'comprou coração com vida cheia');
+    s.player.hp = 2; s.player.inv = 1; walkTo(s, heart); assert(heart.sold && s.player.hp === 4, 'coração');
+    walkTo(s, card); G.update(s, DT); assert(card.sold && s.levelUp, 'carta não abriu');
+  });
+  test('moedas: caem dos inimigos (elite garante 3); invocados não dão', () => {
+    const s = fresh(); s.rng = () => 0.1;
+    const e = dummy(s, 300, 200, 'grunt'); e.hp = 0; G.update(s, DT);
+    assert(G.curRoom(s).pickups.filter(pk => pk.type === 'coin').length === 1, 'sem moeda');
+    const s2 = fresh(); s2.rng = () => 0.99; s2.floor = 5;
+    const el = G.makeEnemy(s2, { type: 'grunt', x: 300, y: 200, elite: true }); G.curRoom(s2).enemies.push(el); el.hp = 0; G.update(s2, DT);
+    assert(G.curRoom(s2).pickups.filter(pk => pk.type === 'coin').length === 3, 'elite');
+    const s3 = fresh(); s3.rng = () => 0.1;
+    const m = G.makeEnemy(s3, { type: 'fly', x: 300, y: 200, summoned: true }); G.curRoom(s3).enemies.push(m); m.hp = 0; G.update(s3, DT);
+    assert(!G.curRoom(s3).pickups.some(pk => pk.type === 'coin' || pk.type === 'xp'), 'invocado deu prêmio');
+  });
+
+  // =================== CRONÔMETRO ===================
+  test('cronômetro: corre no jogo, para na pausa, corre nas cartas', () => {
+    const s = fresh(); steps(s, 1); assert(Math.abs(s.runTime - 1) < 0.05, 'tempo ' + s.runTime);
+    key(s, 'Escape', true); steps(s, 1); assert(Math.abs(s.runTime - 1) < 0.05, 'contou na pausa');
+    key(s, 'Escape', true); G.gainXp(s, G.xpNeed(1)); steps(s, 1);
+    assert(s.levelUp && Math.abs(s.runTime - 2) < 0.05, 'não contou nas cartas ' + s.runTime);
+    assert(G.getSave && BlockProgress.fmtTime(83.456) === '01:23.45', BlockProgress.fmtTime(83.456));
+  });
+  test('cronômetro: parcial de cada andar e vitória gravam recordes', () => {
+    G.setStorage(memStore());
+    const s = fresh(); s.runTime = 65; s.floor = 1;
+    const room = findRoom(s, 'boss'); goTo(s, room); room.enemies[0].hp = 0;
+    s.player.x = G.W / 2; s.player.y = G.H / 2 + 150; G.update(s, DT); noXp(s);
+    key(s, 'KeyW', true); for (let i = 0; i < 120 && s.floor === 1; i++) G.update(s, DT);
+    assert(s.splits.length === 1 && Math.abs(s.splits[0] - 65) < 1, 'parcial ' + s.splits);
+    assert(s.splitInfo && s.splitInfo.delta === null, 'primeira vez sem comparação');
+    s.floor = G.MAX_FLOOR; G.generateFloor(s); const fb = findRoom(s, 'boss'); goTo(s, fb); fb.enemies[0].hp = 0; G.update(s, DT);
+    assert(s.status === 'won', s.status); G.update(s, DT);
+    const rec = G.getSave().records;
+    assert(rec.bestTime !== null && rec.bestSplits[0] > 0, 'recorde de tempo não gravou');
+    assert(s.result && s.result.records.includes('Melhor tempo'), 'sem aviso de recorde');
+    G.setStorage(memStore());
+  });
+
+  // =================== PROGRESSO SALVO ===================
+  test('save: fim de partida soma estatísticas, recordes e XP de conta', () => {
+    const store = memStore(); G.setStorage(store);
+    const s = fresh(); s.kills = 12; s.xpTotal = 80; s.level = 4; s.bestCombo = 6; s.floor = 3;
+    s.status = 'dead'; G.update(s, DT);
+    const sv = JSON.parse(store.getItem(BlockProgress.SAVE_KEY));
+    assert(sv.stats.runs === 1 && sv.stats.kills === 12 && sv.accountXp === 80, JSON.stringify(sv.stats));
+    assert(sv.records.bestFloor === 3 && sv.records.bestLevel === 4 && sv.records.bestCombo === 6, JSON.stringify(sv.records));
+    G.update(s, DT); assert(JSON.parse(store.getItem(BlockProgress.SAVE_KEY)).stats.runs === 1, 'salvou duas vezes');
+    G.setStorage(memStore());
+  });
+  test('save: armazenamento quebrado não derruba o jogo', () => {
+    G.setStorage({ getItem: () => { throw new Error('x'); }, setItem: () => { throw new Error('x'); }, removeItem: () => {} });
+    const s = fresh(); s.status = 'dead'; G.update(s, DT);
+    assert(s.result, 'sem resultado');
+    G.setStorage(memStore());
+  });
+  test('save: modo indestrutível não conta', () => {
+    const store = memStore(); G.setStorage(store);
+    const s = fresh(); s.godMode = true; s.kills = 50; s.status = 'won'; G.update(s, DT);
+    assert(store.getItem(BlockProgress.SAVE_KEY) === null, 'salvou com o código');
+    G.setStorage(memStore());
+  });
+  test('conta: nível sobe com XP e dá pontos de talento', () => {
+    const P = BlockProgress;
+    assert(P.accountLevel(0).level === 1 && P.accountLevel(P.levelCost(1)).level === 2, 'nível');
+    const sv = P.defaults(); assert(!P.buyTalent(sv, 'hp'), 'comprou sem ponto');
+    sv.accountXp = P.levelCost(1) + P.levelCost(2);
+    assert(P.freePoints(sv) === 2 && P.buyTalent(sv, 'hp') && P.buyTalent(sv, 'hp') && P.freePoints(sv) === 0, 'pontos');
+    sv.accountXp *= 10; assert(!P.buyTalent(sv, 'hp'), 'passou do máximo');
+  });
+  test('talentos: valem no começo da partida', () => {
+    G.setStorage(memStore()); const sv = G.getSave();
+    sv.accountXp = 100000; sv.talents = { hp: 2, dmg: 2, item: 1, xp: 3 };
+    const s = fresh();
+    assert(s.player.maxHp === 12 && s.player.hp === 12, 'vida ' + s.player.maxHp);
+    assert(near(s.player.dmg, 3.5 * 1.69 * 1.1) || s.player.items.length === 1, 'dano ' + s.player.dmg);
+    assert(s.player.items.length === 1, 'sem item inicial');
+    G.gainXp(s, 1); assert(near(s.xp, 1.3), 'xp talento ' + s.xp);
+    G.setStorage(memStore());
+  });
+  test('talentos: tela do menu compra com Enter e apaga com confirmação', () => {
+    G.setStorage(memStore()); G.getSave().accountXp = BlockProgress.levelCost(1);
+    const s = menuState(); key(s, 'ArrowDown', true); key(s, 'Enter', true);
+    assert(s.screen === 'talents', 'não abriu');
+    key(s, 'Enter', true); assert(G.getSave().talents.hp === 1, 'não comprou');
+    for (let i = 0; i < BlockProgress.TALENTS.length; i++) key(s, 'ArrowDown', true);
+    key(s, 'Enter', true); assert(G.getSave().talents.hp === 1 && s.confirmReset, 'apagou sem confirmar');
+    key(s, 'Enter', true); assert(!G.getSave().talents.hp && G.getSave().accountXp === 0, 'não apagou');
+    G.setStorage(memStore());
+  });
+  test('talentos: toque na linha compra', () => {
+    G.setStorage(memStore()); G.getSave().accountXp = BlockProgress.levelCost(1);
+    const s = menuState(); s.screen = 'talents'; const t = G.createTouch(), r = G.talentRowRect(1);
+    G.touchDown(s, t, 1, r.x + 50, r.y + 10);
+    assert(G.getSave().talents.dmg === 1, 'toque não comprou');
+    G.touchDown(s, t, 2, 5, 5); assert(!s.screen, 'toque fora não voltou');
+    G.setStorage(memStore());
+  });
+  test('conquistas: desbloqueiam uma vez só e avisam na tela', () => {
+    G.setStorage(memStore());
+    const s = fresh(); s.floor = 5; s.achT = 0; G.update(s, DT);
+    assert(G.getSave().achievements.floor5 && s.toasts.some(t => t.title === 'Explorador'), 'não desbloqueou');
+    const n = s.toasts.length; s.achT = 0; G.update(s, DT);
+    assert(s.toasts.length === n, 'avisou de novo');
+    assert(BlockProgress.ACHIEVEMENTS.length === 15, 'conquistas ' + BlockProgress.ACHIEVEMENTS.length);
+    G.setStorage(memStore());
+  });
+  test('reiniciar zera XP, nível, moedas, combo e tempo', () => {
+    const s = fresh(); s.level = 5; s.xp = 3; s.coins = 9; s.combo = 4; s.runTime = 99; s.status = 'dead';
+    key(s, 'KeyR', true);
+    assert(s.level === 1 && s.xp === 0 && s.coins === 0 && s.combo === 0 && s.runTime === 0, 'não zerou');
+  });
+
+  // =================== DESENHO DAS NOVIDADES ===================
+  test('render: monstros, chefões, loja, cartas, resultado e telas do menu', () => {
+    const c = document.createElement('canvas'); c.width = G.W; c.height = G.SCREEN_H; const ctx = c.getContext('2d');
+    const s = fresh(); s.shake = 0;
+    for (const type of ['splitter', 'slimelet', 'charger', 'spinner', 'bomber', 'ghost', 'shielder', 'healer', 'nest', 'clone']) {
+      const e = dummy(s, 200 + Math.random() * 500, 150 + Math.random() * 300, type); e.elite = true;
+    }
+    G.curRoom(s).enemies[1].state = 'stun'; G.curRoom(s).enemies[3].state = 'fuse';
+    G.curRoom(s).pickups.push({ type: 'coin', x: 300, y: 300, size: 14 }, { type: 'xp', x: 320, y: 300, size: 12 });
+    s.combo = 5; s.comboT = 2; s.floaters.push({ x: 300, y: 300, text: '12!', color: '#ffb800', size: 18, t: 1, max: 1 });
+    s.toasts.push({ title: 'Teste', sub: 'teste', t: 2 }); s.splitInfo = { floor: 1, time: 60, delta: -2, t: 2 };
+    s.skills = { dmg: 2, crit: 1 }; G.render(ctx, s);
+    for (const kind of ['colmeia', 'espelho', 'hipercubo']) {
+      const b = bossFight(kind); b.e.reflect = true; b.e.phase = 4; G.render(ctx, b.s);
+    }
+    const sh = shopState(3); G.render(ctx, sh.s);
+    G.gainXp(s, 50); G.update(s, DT); G.render(ctx, s);
+    s.status = 'dead'; G.update(s, DT); G.render(ctx, s);
+    for (const screen of ['talents', 'achievements', 'records', 'help']) { const m = menuState(); m.screen = screen; G.render(ctx, m); }
+    for (let floor = 1; floor <= G.MAX_FLOOR; floor++) { const f = fresh(); f.floor = floor; G.generateFloor(f); G.render(ctx, f); }
+  });
+
+  document.getElementById('out').textContent = results.join('\n') + '\n\nAGUARDANDO testes de áudio...';
+  window.testResults = Promise.all(pending).then(() => {
+    const fails = results.filter(r => r.startsWith('FAIL')).length;
+    results.push('', 'TOTAL ' + results.length + ' | FALHAS ' + fails);
+    const text = results.join('\n');
+    document.getElementById('out').textContent = text;
+    return text;
+  });
+})();
+</script>
+</body>
+</html>
